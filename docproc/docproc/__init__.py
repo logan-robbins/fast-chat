@@ -1,0 +1,58 @@
+"""
+Document Processing Library (docproc)
+
+A library for document extraction, summarization, and vector storage.
+Supports PDF, PPTX, DOCX, XLSX, CSV, and text files.
+
+Usage:
+    from docproc import process_file, search_documents, DocumentStore
+    
+    # Process a file
+    result = await process_file(content, filename)
+    
+    # Search documents
+    results = await search_documents("query text", limit=5)
+
+Configuration:
+    OPENAI_API_KEY: Required for embeddings and summarization
+    CHROMA_PERSIST_DIR: Optional path to persist vector store
+"""
+
+from docproc.services.file_processor import extract_text_from_file, download_and_process_url
+from docproc.services.summarization import summarize_text_async, summarize_single_file
+from docproc.services.document_store import (
+    store_document_with_chunks,
+    check_document_exists,
+    delete_document,
+    get_all_documents,
+    get_document_count,
+    clear_all_documents,
+    ensure_vector_store_initialized,
+)
+from docproc.utils.vector_store import ChromaVectorStore, get_vector_store
+from docproc.utils.llm_config import get_llm_model, get_embeddings_model
+
+__version__ = "2.1.0"
+
+__all__ = [
+    # File processing
+    "extract_text_from_file",
+    "download_and_process_url",
+    # Summarization
+    "summarize_text_async",
+    "summarize_single_file",
+    # Document storage
+    "store_document_with_chunks",
+    "check_document_exists", 
+    "delete_document",
+    "get_all_documents",
+    "get_document_count",
+    "clear_all_documents",
+    "ensure_vector_store_initialized",
+    # Vector store
+    "ChromaVectorStore",
+    "get_vector_store",
+    # LLM
+    "get_llm_model",
+    "get_embeddings_model",
+]

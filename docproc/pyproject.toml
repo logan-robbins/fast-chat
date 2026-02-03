@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docproc"
+version = "2.1.0"
+description = "Document processing library for extraction, summarization, and vector storage"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # LLM and embeddings
+    "langchain>=0.1.0",
+    "langchain-text-splitters>=0.0.1",
+    "langchain_openai>=0.0.5",
+    "openai>=1.10.0",
+    # Vector database
+    "chromadb>=0.4.22",
+    # HTTP client
+    "aiohttp>=3.9.0",
+    # Document processing - PDF
+    "pdf2image>=1.17.0",
+    "pdfplumber>=0.10.0",
+    "Pillow>=10.2.0",
+    # Document processing - Office formats
+    "python-pptx>=0.6.23",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.2",
+    "pandas>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+local = [
+    "langchain-ollama>=0.0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["docproc*"]
