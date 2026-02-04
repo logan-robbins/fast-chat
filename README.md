@@ -8,8 +8,8 @@ A document-aware chat platform with RAG capabilities and OpenAI API compatibilit
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              Client (Web/API)                                │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
+                                       │
+                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            chat-api (BFF)                                    │
 │  FastAPI service that handles:                                               │
@@ -17,10 +17,10 @@ A document-aware chat platform with RAG capabilities and OpenAI API compatibilit
 │  - Thread management (SQLite)                                                │
 │  - File uploads & processing (uses docproc)                                  │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                          ┌───────────┴───────────┐
-                          │                       │
-                          ▼                       ▼
+                                       │
+                           ┌───────────┴───────────┐
+                           │                       │
+                           ▼                       ▼
 ┌─────────────────────────────────┐  ┌─────────────────────────────────────────┐
 │         chat-app                │  │              docproc                     │
 │  LangGraph agent with:          │  │  Document processing library:            │
@@ -29,6 +29,13 @@ A document-aware chat platform with RAG capabilities and OpenAI API compatibilit
 │  - Web search tool              │  │  - Summarization                         │
 │  - Code interpreter             │  │  - ChromaDB vector storage               │
 └─────────────────────────────────┘  └─────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────┐
+│            Redis                │
+│  - State management             │
+│  - Request cancellation         │
+└─────────────────────────────────┘
 ```
 
 ## Components
@@ -36,8 +43,9 @@ A document-aware chat platform with RAG capabilities and OpenAI API compatibilit
 | Component | Purpose | Port |
 |-----------|---------|------|
 | `chat-api` | OpenAI-compatible API, threads, files | 8000 |
-| `chat-app` | LangGraph multi-agent orchestrator | 8080 |
+| `chat-app` | LangGraph multi-agent orchestrator | 8000 |
 | `docproc` | Document processing library | (library) |
+| `redis` | State management, cancellation | 6379 |
 | `local-dev` | Docker Compose development setup | - |
 
 ## Quick Start
@@ -51,12 +59,14 @@ pip install -e ./docproc
 
 # 3. Install and run chat-api
 cd chat-api
+uv venv --python 3.12 .venv
 pip install -e .
 uvicorn src.main:app --port 8000
 
 # 4. Install and run chat-app (separate terminal)
 cd chat-app
-pip install -e .
+uv venv --python 3.12 .venv
+uv pip install -e ".[dev]"
 langgraph dev
 ```
 
@@ -83,7 +93,16 @@ All services default to OpenAI APIs:
 - `text-embedding-3-small` for embeddings
 - Optional local models via `USE_LOCAL_MODELS=true`
 
-### 4. Smart Document Routing
+### 4. Multi-Agent Architecture
+
+chat-app uses a supervisor pattern with isolated context handoffs:
+- **Supervisor**: Routes requests to specialized agents
+- **WebSearch Agent**: Perplexity API for current information
+- **Knowledge Base Agent**: RAG over uploaded documents
+- **Code Interpreter Agent**: Python execution with file tools
+- **Isolated Context**: Each agent receives only task description, not full conversation history
+
+### 5. Smart Document Routing
 
 Documents are processed based on type:
 - **Text files**: Direct read (no API calls)
@@ -113,6 +132,10 @@ EMBEDDING_MODEL=text-embedding-3-small
 
 # Web search (for chat-app)
 PERPLEXITY_API_KEY=pplx-...
+
+# Redis (optional, defaults to localhost:6379)
+REDIS_HOST=localhost
+REDIS_PORT=6379
 
 # Local development
 USE_LOCAL_MODELS=true
@@ -146,12 +169,12 @@ cd docproc && pytest
 cd chat-api && pytest  
 cd chat-app && pytest
 
-# Docker Compose
-cd local-dev
-make up
+# Docker Compose (from project root)
+docker-compose up
 ```
 
 ## Storage
 
 - **SQLite**: Thread and message persistence (chat-api)
 - **ChromaDB**: Vector embeddings for RAG (docproc)
+- **Redis**: Request cancellation and state management (chat-app)

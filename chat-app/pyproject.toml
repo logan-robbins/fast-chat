@@ -19,6 +19,8 @@ dependencies = [
     "arize-phoenix>=4.0.0",
     "openinference-instrumentation-langchain>=0.1.0",
     "langgraph-supervisor>=0.0.1",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
 ]
 
 [build-system]
@@ -29,11 +31,12 @@ build-backend = "setuptools.build_meta"
 packages = ["chat_app"]
 package-dir = {"" = "src"}
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
     "pytest-cov>=6.2.1",
+    "langgraph-cli>=0.1.0",
 ]
 
 [tool.pytest.ini_options]

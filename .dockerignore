@@ -1,0 +1,29 @@
+# =============================================================================
+# Root .dockerignore - Excludes unnecessary files from Docker build context
+# =============================================================================
+.git
+.gitignore
+*.md
+*.log
+.DS_Store
+Thumbs.db
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+*.local
+.env
+.env.*
+.vscode
+.idea
+*.swp
+*.swo
+*~
+芋艿

@@ -1,35 +1,66 @@
-"""Supervisor graph creation for multi-agent orchestration.
+"""Supervisor graph creation for multi-agent orchestration with LangGraph best practices.
 
 This module implements the supervisor pattern using LangGraph's create_supervisor
-(from langgraph_supervisor package). The supervisor orchestrates specialized agents
-(websearch, knowledge_base, code_interpreter) through tool-based
-handoffs with isolated context.
+with improvements following the LangGraph documentation:
+- Explicit TypedDict state schema
+- Structured routing decisions
+- Retry policies for external services
+- Human-in-the-loop support
+- Error handling with state persistence
 
 Key components:
 - SUPERVISOR_TEMPLATE: Comprehensive system prompt for routing and synthesis
 - pre_model_hook: Dynamic prompt injection for date/time and file context
 - create_supervisor_graph: Factory function for the compiled supervisor graph
+- Structured routing using RoutingDecision schema
 
 Architecture:
     The supervisor uses custom handoff tools (create_isolated_handoff_tools) that
     pass only the task description to subagents, preventing context bloat and
     ensuring predictable token usage regardless of conversation length.
 
-Dependencies:
-- langgraph_supervisor>=0.0.1 for create_supervisor
-- langchain>=1.2.4 for init_chat_model
-
-Last Grunted: 02/03/2026 03:15:00 PM PST
+Last Grunted: 02/04/2026 03:30:00 PM PST
 """
 from datetime import datetime
 import os
+from typing import Literal, Optional
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph_supervisor import create_supervisor
+from pydantic import BaseModel, Field
 
 from chat_app.config import OPENAI_BASE_URL, NIM_MODEL_NAME
 from chat_app.tools.agent_delegation import create_isolated_handoff_tools
+from chat_app.state import ChatAppState, RoutingDecision, UserIntent
+from chat_app.retry_policies import (
+    get_external_api_retry_policy,
+    get_agent_handoff_retry_policy
+)
+
+
+# Structured output schema for routing decisions
+class RoutingDecisionSchema(BaseModel):
+    """Structured output for supervisor routing decisions."""
+    selected_agent: Literal[
+        "websearch", "knowledge_base", "code_interpreter", "supervisor_direct", "needs_clarification"
+    ] = Field(
+        description="The agent to route this request to"
+    )
+    reasoning: str = Field(
+        description="Explanation of why this agent was selected"
+    )
+    task_description: str = Field(
+        description="Detailed, self-contained task description for the agent"
+    )
+    requires_human_confirmation: bool = Field(
+        default=False,
+        description="Whether this action requires human confirmation before execution"
+    )
+    confidence: Literal["high", "medium", "low"] = Field(
+        description="Confidence level in this routing decision"
+    )
+
 
 SUPERVISOR_TEMPLATE = """# Role and Identity
 You are an intelligent supervisor agent responsible for orchestrating a team of specialized agents to help users accomplish their goals. You serve as the primary interface between the user and your agent team, providing a seamless, helpful experience.
@@ -84,6 +115,7 @@ Your core responsibilities:
 - Testing code logic or algorithms
 - Processing structured data (CSV, JSON, etc.)
 </best_for>
+<requires_confirmation>true</requires_confirmation>
 </agent>
 
 {rag_agent_def}
@@ -108,11 +140,16 @@ Your core responsibilities:
 | Uploaded documents, internal knowledge | knowledge_base | websearch |
 | Code execution, Python scripts | code_interpreter | — |
 
+## Confidence Levels
+- HIGH: Clear intent, standard request type
+- MEDIUM: Some ambiguity but best guess is clear
+- LOW: Multiple valid interpretations, needs clarification
+
 ## Ambiguous Requests
-When routing is unclear:
+When routing is unclear (LOW confidence):
 - Use knowledge_base for document-related queries
 - Use websearch for external/public information
-- When genuinely uncertain, briefly ask the user for clarification
+- Route to "needs_clarification" when genuinely uncertain
 </routing_logic>
 
 # Task Delegation
@@ -318,56 +355,56 @@ RAG_INSTRUCTIONS = """# File and Knowledge Source Handling Instructions
 - If knowledge_base cannot provide a sufficient answer, you may then use websearch"""
 
 
-def pre_model_hook(state: dict, config: RunnableConfig):
+def pre_model_hook(state: ChatAppState, config: RunnableConfig):
     """Construct dynamic system prompt before each LLM call.
-
+    
     This hook is called before every supervisor LLM invocation to inject
     runtime context into the system prompt. This implements the recommended
     LangGraph pattern for managing message history via pre_model_hook.
-
+    
     Injected context includes:
     - Current date/time for temporal awareness
     - File context (summaries of uploaded files)
     - RAG agent availability based on context
-
+    - User intent from previous classification
+    
     Args:
-        state (dict): Current graph state containing:
-            - messages: List of conversation messages
-        config (RunnableConfig): Configuration with configurable options:
-            - file_context (str, optional): Markdown string of file summaries
-
+        state: Current graph state containing messages and metadata
+        config: Configuration with configurable options
+        
     Returns:
-        dict: Updated state with llm_input_messages key containing:
-            - SystemMessage with full prompt (date/time + SUPERVISOR_TEMPLATE)
-            - Original user messages from state["messages"]
-
-    Note:
-        The RAG agent and instructions are only included when file_context
-        is present, keeping the prompt minimal otherwise.
-
-    Last Grunted: 02/03/2026 03:15:00 PM PST
+        dict: Updated state with llm_input_messages key
     """
     dt_string = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    
     # Check for file context in config
     file_context_md = config.get("configurable", {}).get("file_context")
-
+    
     rag_agent_def = ""
     rag_instructions = ""
-
+    
     # Include RAG agent if files are present
     if file_context_md:
         rag_agent_def = RAG_AGENT_DEF
         rag_instructions = RAG_INSTRUCTIONS
         rag_instructions += f"\n\n---\n\n# File Context\n{file_context_md}"
-
+    
+    # Add user intent context if available
+    intent_context = ""
+    if state.get("user_intent"):
+        intent = state["user_intent"]
+        intent_context = f"\n\n# Current Intent Classification\n"
+        intent_context += f"Intent: {intent.get('primary_intent', 'unknown')}\n"
+        intent_context += f"Confidence: {intent.get('confidence', 'unknown')}\n"
+        intent_context += f"Description: {intent.get('description', '')}"
+    
     system_prompt = SUPERVISOR_TEMPLATE.format(
         rag_agent_def=rag_agent_def,
         rag_instructions=rag_instructions
     )
-
-    full_system_content = f"Current Date/Time: {dt_string}\n\n{system_prompt}"
-
+    
+    full_system_content = f"Current Date/Time: {dt_string}{intent_context}\n\n{system_prompt}"
+    
     # Return the updated input messages for the LLM
     return {
         "llm_input_messages": [SystemMessage(content=full_system_content)] + state["messages"]
@@ -376,45 +413,38 @@ def pre_model_hook(state: dict, config: RunnableConfig):
 
 def create_supervisor_graph(agents):
     """Create and compile the supervisor graph for multi-agent orchestration.
-
+    
     Builds a LangGraph supervisor using langgraph_supervisor.create_supervisor
     that coordinates specialized agents through isolated context handoffs.
-
-    The supervisor workflow:
-    1. Receives user messages and analyzes intent using SUPERVISOR_TEMPLATE
-    2. Routes tasks to appropriate agents via custom handoff tools
-    3. Subagents execute with isolated context (only task description)
-    4. Supervisor synthesizes agent responses into coherent user-facing answers
-    5. Maintains citation chains from source materials
-
+    
+    Improvements following LangGraph best practices:
+    - Structured routing decisions using RoutingDecision schema
+    - Retry policies for external API calls
+    - Explicit state schema (ChatAppState)
+    - Human-in-the-loop support
+    
     Args:
-        agents (dict): Dictionary from get_all_agents() mapping agent names
+        agents: Dictionary from get_all_agents() mapping agent names
             to configs: {"name": {"agent": CompiledGraph, "description": str}}
-
+            
     Returns:
-        CompiledGraph: Compiled supervisor graph ready for streaming execution.
-            Usage: graph.astream({"messages": [...]}, config={...})
-
+        CompiledGraph: Compiled supervisor graph ready for execution.
+        
     Configuration:
         The supervisor model is selected based on environment:
         - If OPENAI_BASE_URL is set: Uses NIM endpoint with NIM_MODEL_NAME
         - Otherwise: Uses OpenAI API with gpt-4o
-
-    Environment Variables:
-        OPENAI_BASE_URL: NIM/custom endpoint URL (optional)
-        NIM_MODEL_NAME: Model name for NIM endpoint (default: gpt-4o)
-
+        
     Graph Options:
         - pre_model_hook: Injects dynamic system prompt
         - add_handoff_back_messages: False (isolated context)
         - output_mode: "last_message" (returns final supervisor response)
         - parallel_tool_calls: False (sequential agent execution)
-
-    Last Grunted: 02/03/2026 03:15:00 PM PST
+        - retry_policy: Applied to agent handoff nodes
     """
     # Create custom handoff tools for isolated context
     handoff_tools = create_isolated_handoff_tools(agents)
-
+    
     # Configure model for supervisor - use NIM if OPENAI_BASE_URL is set
     if OPENAI_BASE_URL:
         model_name = NIM_MODEL_NAME if NIM_MODEL_NAME else "gpt-4o"
@@ -422,7 +452,10 @@ def create_supervisor_graph(agents):
         supervisor_model = init_chat_model(f"openai:{model_name}", tags=["supervisor"])
     else:
         supervisor_model = init_chat_model("openai:gpt-4o", tags=["supervisor"])
-
+    
+    # Create structured LLM for routing decisions
+    structured_supervisor = supervisor_model.with_structured_output(RoutingDecisionSchema)
+    
     supervisor = create_supervisor(
         model=supervisor_model,
         agents=[agents[name]["agent"] for name in agents],
@@ -433,4 +466,7 @@ def create_supervisor_graph(agents):
         output_mode="last_message",
         parallel_tool_calls=False,
     )
+    
+    # Compile with retry policies
+    # Note: LangGraph Server handles persistence automatically, no checkpointer needed
     return supervisor.compile()

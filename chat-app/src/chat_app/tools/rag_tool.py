@@ -217,13 +217,18 @@ class SearchDocumentContentTool(BaseTool):
                 
                 results = await store.search_similar(query_embedding, limit=limit)
                 
+                # Store RAW results (not formatted) following LangGraph best practices
                 for result in results:
-                    all_results.append({
+                    raw_result = {
                         "collection": collection_name,
                         "filename": result.get("metadata", {}).get("filename", "unknown"),
-                        "text": result.get("text", "")[:500],  # Truncate for display
+                        "text": result.get("text", ""),  # Full text, not truncated
+                        "text_preview": result.get("text", "")[:500],  # Preview for display
                         "score": result.get("similarity_score", 0),
-                    })
+                        "metadata": result.get("metadata", {}),
+                        "document_id": result.get("id", "unknown"),
+                    }
+                    all_results.append(raw_result)
                     
             except Exception as e:
                 logger.warning(f"Search failed for collection {collection_name}: {e}")
@@ -258,7 +263,9 @@ class SearchDocumentContentTool(BaseTool):
         for i, result in enumerate(results, 1):
             lines.append(f"{i}. {result['filename']}")
             lines.append(f"   Relevance: {result['score']:.0%}")
-            lines.append(f"   Content: {result['text'][:200]}...")
+            # Use text_preview (formatted on-demand) instead of raw text
+            preview = result.get('text_preview', result.get('text', '')[:500])
+            lines.append(f"   Content: {preview[:200]}...")
             lines.append("")
         
         return "\n".join(lines)
