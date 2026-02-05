@@ -6,7 +6,12 @@ This module provides LangChain tools used by the specialized agents:
 The perplexity_search tool uses Perplexity's sonar model (2025) which provides
 AI-synthesized answers with source citations at ~1200 tokens/second.
 
-Last Grunted: 02/03/2026 03:15:00 PM PST
+Status Streaming (ChatGPT/Claude 2025/2026 patterns):
+    Tools emit user-friendly status events via get_stream_writer():
+    - "Searching the web for: [query]..." at start
+    - "Web search complete" on success
+
+Last Grunted: 02/04/2026 07:30:00 PM PST
 """
 from langchain_core.tools import tool
 from typing import List, Dict, Any
@@ -81,6 +86,17 @@ def perplexity_search(query: str) -> str:
             "query_preview": query[:100]
         }
     )
+    
+    # Emit status event (ChatGPT/Claude-style "Searching the web...")
+    try:
+        from chat_app.status_streaming import emit_tool_start
+        emit_tool_start(
+            tool_name="perplexity_search",
+            agent_name="websearch",
+            details={"query": query[:100]}
+        )
+    except Exception:
+        pass  # Status emission failures should not break tool execution
 
     try:
         # Call Perplexity with search request
@@ -122,6 +138,18 @@ def perplexity_search(query: str) -> str:
                 "sources_count": len(search_results) if search_results else 0
             }
         )
+        
+        # Emit completion status
+        try:
+            from chat_app.status_streaming import emit_tool_complete
+            emit_tool_complete(
+                tool_name="perplexity_search",
+                agent_name="websearch",
+                details={"sources_count": len(search_results) if search_results else 0}
+            )
+        except Exception:
+            pass
+        
         return output
 
     except Exception as e:

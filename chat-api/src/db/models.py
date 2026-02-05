@@ -10,13 +10,56 @@ Defines the database schema for:
 
 All models use UUID primary keys and UTC timestamps.
 
-Last Grunted: 02/03/2026 11:45:00 AM UTC
+Last Grunted: 02/04/2026 04:50:00 PM UTC
 """
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Any
 from sqlmodel import Field, SQLModel, Relationship, Column
-from sqlalchemy import JSON
+from sqlalchemy import JSON, Integer, String, Boolean, DateTime, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class ThreadMetadataMixin:
+    """Mixin for thread metadata fields.
+    
+    Provides computed metadata properties that are calculated
+    on-demand rather than stored in the database.
+    """
+    
+    async def get_message_count(self, session: AsyncSession) -> int:
+        """Get the number of messages in this thread."""
+        result = await session.execute(
+            select(func.count(Message.id)).where(Message.thread_id == self.id)
+        )
+        return result.scalar() or 0
+    
+    async def get_last_message_preview(self, session: AsyncSession, max_length: int = 100) -> Optional[str]:
+        """Get a preview of the last message in this thread."""
+        result = await session.execute(
+            select(Message)
+            .where(Message.thread_id == self.id)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        message = result.scalar_one_or_none()
+        if message and message.content:
+            preview = message.content[:max_length]
+            if len(message.content) > max_length:
+                preview += "..."
+            return preview
+        return None
+    
+    async def get_total_tokens(self, session: AsyncSession) -> int:
+        """Get total token count for this thread."""
+        from sqlalchemy import func
+        # Estimate ~4 characters per token
+        result = await session.execute(
+            select(func.sum(func.length(Message.content) / 4))
+            .where(Message.thread_id == self.id)
+        )
+        total = result.scalar()
+        return int(total) if total else 0
 
 
 class Thread(SQLModel, table=True):
@@ -25,24 +68,40 @@ class Thread(SQLModel, table=True):
     
     Represents a single conversation session containing multiple messages.
     Used for maintaining conversation history and context.
+    Links to LangGraph checkpoint for conversation state.
     
     Attributes:
         id: Unique thread identifier (UUID)
         user_id: User who owns this thread (UUID)
         title: Optional thread title (typically first message excerpt)
+        checkpoint_id: LangGraph checkpoint ID for thread state
+        checkpoint_ns: LangGraph checkpoint namespace
         created_at: UTC timestamp of creation
         updated_at: UTC timestamp of last update
         messages: Related Message objects (relationship)
         
+        # Metadata fields
+        is_pinned: Whether thread is pinned
+        title_generated_at: When title was auto-generated
+        title_generation_model: Model used for title generation
+        
     Table: thread
     
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 04:50:00 PM UTC
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(index=True)
     title: Optional[str] = Field(default=None)
+    # Link to LangGraph checkpoint for conversation state
+    checkpoint_id: Optional[str] = Field(default=None, index=True)
+    checkpoint_ns: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # Metadata fields
+    is_pinned: bool = Field(default=False)
+    title_generated_at: Optional[datetime] = Field(default=None)
+    title_generation_model: Optional[str] = Field(default=None)
 
     messages: List["Message"] = Relationship(back_populates="thread")
 

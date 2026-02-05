@@ -7,59 +7,90 @@ with improvements following the LangGraph documentation:
 - Retry policies for external services
 - Human-in-the-loop support
 - Error handling with state persistence
+- Message trimming and summarization for long conversations
 
 Key components:
 - SUPERVISOR_TEMPLATE: Comprehensive system prompt for routing and synthesis
 - pre_model_hook: Dynamic prompt injection for date/time and file context
 - create_supervisor_graph: Factory function for the compiled supervisor graph
-- Structured routing using RoutingDecision schema
 
 Architecture:
     The supervisor uses custom handoff tools (create_isolated_handoff_tools) that
     pass only the task description to subagents, preventing context bloat and
     ensuring predictable token usage regardless of conversation length.
 
-Last Grunted: 02/04/2026 03:30:00 PM PST
+Context Engineering:
+    - Messages are trimmed before each LLM call using pre_model_hook
+    - Older messages are summarized to preserve context while reducing tokens
+    - User memories are retrieved via semantic search for personalization
+    - File context is injected when documents are uploaded
+
+Last Grunted: 02/04/2026 06:30:00 PM PST
 """
 from datetime import datetime
+import logging
 import os
-from typing import Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
+
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages.utils import trim_messages
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph_supervisor import create_supervisor
 from pydantic import BaseModel, Field
 
-from chat_app.config import OPENAI_BASE_URL, NIM_MODEL_NAME
+from chat_app.config import OPENAI_BASE_URL, NIM_MODEL_NAME, get_settings
+from chat_app.memory import format_memories_for_prompt, search_user_memories
+from chat_app.state import ChatAppState
+from chat_app.summarization import count_message_tokens, maybe_summarize
 from chat_app.tools.agent_delegation import create_isolated_handoff_tools
-from chat_app.state import ChatAppState, RoutingDecision, UserIntent
-from chat_app.retry_policies import (
-    get_external_api_retry_policy,
-    get_agent_handoff_retry_policy
-)
+
+logger = logging.getLogger(__name__)
 
 
-# Structured output schema for routing decisions
-class RoutingDecisionSchema(BaseModel):
-    """Structured output for supervisor routing decisions."""
-    selected_agent: Literal[
-        "websearch", "knowledge_base", "code_interpreter", "supervisor_direct", "needs_clarification"
-    ] = Field(
-        description="The agent to route this request to"
-    )
-    reasoning: str = Field(
-        description="Explanation of why this agent was selected"
-    )
-    task_description: str = Field(
-        description="Detailed, self-contained task description for the agent"
-    )
-    requires_human_confirmation: bool = Field(
-        default=False,
-        description="Whether this action requires human confirmation before execution"
-    )
-    confidence: Literal["high", "medium", "low"] = Field(
-        description="Confidence level in this routing decision"
-    )
+async def get_relevant_memories(user_id: str, query: str, limit: int = 3) -> str:
+    """Retrieve user memories relevant to the current query via semantic search.
+    
+    Uses the PostgresStore semantic search to find memories that are contextually
+    relevant to the user's current message. These memories are then formatted
+    for inclusion in the system prompt.
+    
+    Args:
+        user_id: The user's unique identifier for memory namespace.
+        query: The current user message to match against stored memories.
+        limit: Maximum number of memories to return (default: 3).
+        
+    Returns:
+        str: Formatted memories string for prompt injection, or empty string
+            if no memories found or user_id is not provided.
+            
+    Note:
+        Silently handles exceptions to ensure memory lookup failures
+        don't break the main conversation flow.
+        
+    Last Grunted: 02/04/2026 06:30:00 PM PST
+    """
+    if not user_id:
+        return ""
+    
+    try:
+        memories = await search_user_memories(user_id, query, limit=limit)
+        if memories:
+            return format_memories_for_prompt(memories)
+    except Exception as e:
+        logger.warning(
+            "Memory lookup failed",
+            extra={"user_id": user_id, "error": str(e)}
+        )
+    
+    return ""
+
+
+# Context window management constants
+MAX_CONTEXT_TOKENS: int = 116000  # 128k - 4k system - 8k response buffer
+TRIM_THRESHOLD: int = 120000  # Trigger trimming above this threshold
 
 
 SUPERVISOR_TEMPLATE = """# Role and Identity
@@ -355,73 +386,208 @@ RAG_INSTRUCTIONS = """# File and Knowledge Source Handling Instructions
 - If knowledge_base cannot provide a sufficient answer, you may then use websearch"""
 
 
-def pre_model_hook(state: ChatAppState, config: RunnableConfig):
-    """Construct dynamic system prompt before each LLM call.
+async def pre_model_hook(
+    state: ChatAppState,
+    config: RunnableConfig
+) -> Dict[str, Any]:
+    """Construct dynamic system prompt and trim messages before each LLM call.
     
-    This hook is called before every supervisor LLM invocation to inject
-    runtime context into the system prompt. This implements the recommended
-    LangGraph pattern for managing message history via pre_model_hook.
+    This hook implements LangGraph's recommended pattern for managing message
+    history. It is called before every supervisor LLM invocation to:
     
-    Injected context includes:
-    - Current date/time for temporal awareness
-    - File context (summaries of uploaded files)
-    - RAG agent availability based on context
-    - User intent from previous classification
+    1. Trim messages to fit within the context window
+    2. Summarize older messages that were trimmed
+    3. Inject runtime context (date/time, file context, memories)
+    4. Build the complete system prompt with relevant agent definitions
+    
+    Context Engineering Strategy:
+        - Messages exceeding TRIM_THRESHOLD trigger summarization
+        - Summary is prepended to provide context for trimmed history
+        - User memories are retrieved via semantic search
+        - File context enables RAG agent when documents are present
     
     Args:
-        state: Current graph state containing messages and metadata
-        config: Configuration with configurable options
+        state: Current graph state containing messages and metadata.
+        config: RunnableConfig with configurable options including:
+            - file_context: Markdown-formatted file summaries
+            - user_id: User identifier for memory retrieval
         
     Returns:
-        dict: Updated state with llm_input_messages key
+        dict: State update containing:
+            - llm_input_messages: Messages to send to the LLM
+            - conversation_summary: Updated summary (if changed)
+            
+    Note:
+        This function never mutates state directly - it returns updates
+        that LangGraph applies immutably.
+        
+    Last Grunted: 02/04/2026 06:30:00 PM PST
     """
     dt_string = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # Check for file context in config
-    file_context_md = config.get("configurable", {}).get("file_context")
+    # Extract current state
+    messages: List[BaseMessage] = state.get("messages", [])
+    existing_summary: str = state.get("conversation_summary", "")
+    new_summary: str = existing_summary
     
+    # Trim messages if they exceed the context threshold
+    if messages:
+        total_tokens = count_message_tokens(messages)
+        
+        if total_tokens > TRIM_THRESHOLD:
+            logger.info(
+                "Trimming messages",
+                extra={
+                    "original_tokens": total_tokens,
+                    "threshold": TRIM_THRESHOLD,
+                    "message_count": len(messages)
+                }
+            )
+            messages, new_summary = await maybe_summarize(
+                messages,
+                existing_summary=existing_summary,
+                max_tokens=MAX_CONTEXT_TOKENS,
+                summarize_threshold=TRIM_THRESHOLD
+            )
+    
+    # Extract configurable values
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    file_context_md: Optional[str] = configurable.get("file_context")
+    user_id: Optional[str] = configurable.get("user_id")
+    
+    # Build RAG agent definition if files are present
     rag_agent_def = ""
     rag_instructions = ""
     
-    # Include RAG agent if files are present
     if file_context_md:
         rag_agent_def = RAG_AGENT_DEF
         rag_instructions = RAG_INSTRUCTIONS
         rag_instructions += f"\n\n---\n\n# File Context\n{file_context_md}"
     
-    # Add user intent context if available
+    # Build intent context if classification is available
     intent_context = ""
-    if state.get("user_intent"):
-        intent = state["user_intent"]
-        intent_context = f"\n\n# Current Intent Classification\n"
-        intent_context += f"Intent: {intent.get('primary_intent', 'unknown')}\n"
-        intent_context += f"Confidence: {intent.get('confidence', 'unknown')}\n"
-        intent_context += f"Description: {intent.get('description', '')}"
+    user_intent = state.get("user_intent")
+    if user_intent:
+        intent_context = (
+            f"\n\n# Current Intent Classification\n"
+            f"Intent: {user_intent.get('primary_intent', 'unknown')}\n"
+            f"Confidence: {user_intent.get('confidence', 'unknown')}\n"
+            f"Description: {user_intent.get('description', '')}"
+        )
     
+    # Build summary context for older messages
+    summary_context = ""
+    if new_summary:
+        summary_context = f"\n\n# Conversation Summary (Earlier Messages)\n{new_summary}\n"
+    
+    # Retrieve relevant user memories via semantic search
+    memory_context = ""
+    if user_id and messages:
+        last_user_msg = _extract_last_human_message(messages)
+        if last_user_msg:
+            memory_context_str = await get_relevant_memories(user_id, last_user_msg, limit=3)
+            if memory_context_str:
+                memory_context = f"\n\n{memory_context_str}\n"
+    
+    # Assemble the complete system prompt
     system_prompt = SUPERVISOR_TEMPLATE.format(
         rag_agent_def=rag_agent_def,
         rag_instructions=rag_instructions
     )
     
-    full_system_content = f"Current Date/Time: {dt_string}{intent_context}\n\n{system_prompt}"
+    full_system_content = (
+        f"Current Date/Time: {dt_string}"
+        f"{intent_context}{memory_context}{summary_context}"
+        f"\n\n{system_prompt}"
+    )
     
-    # Return the updated input messages for the LLM
+    # Return state update (never mutate state directly)
     return {
-        "llm_input_messages": [SystemMessage(content=full_system_content)] + state["messages"]
+        "llm_input_messages": [SystemMessage(content=full_system_content)] + messages,
+        "conversation_summary": new_summary
     }
 
 
-def create_supervisor_graph(agents):
+def _extract_last_human_message(messages: List[BaseMessage]) -> Optional[str]:
+    """Extract the content of the last human message from a message list.
+    
+    Args:
+        messages: List of LangChain message objects.
+        
+    Returns:
+        str | None: Content of the last human message, or None if not found.
+        
+    Last Grunted: 02/04/2026 06:30:00 PM PST
+    """
+    for msg in reversed(messages):
+        if hasattr(msg, 'type') and msg.type == 'human':
+            return msg.content
+    return None
+
+
+def get_checkpointer():
+    """Get the configured checkpointer based on settings.
+    
+    Returns either a PostgresSaver or InMemorySaver based on
+    the CHECKPOINTER_TYPE setting. PostgreSQL is recommended for
+    production as it supports persistence, time-travel debugging,
+    and up to 1GB state per checkpoint.
+    
+    Returns:
+        BaseCheckpointSaver: Configured checkpointer instance.
+            - PostgresSaver: For production with DATABASE_URL
+            - InMemorySaver: For development/testing
+            
+    Raises:
+        ValueError: If CHECKPOINTER_TYPE=postgres but DATABASE_URL is not set.
+        
+    Last Grunted: 02/04/2026 06:30:00 PM PST
+    """
+    settings = get_settings()
+    
+    if settings.checkpointer_type == "postgres":
+        if not settings.database_url:
+            raise ValueError(
+                "DATABASE_URL must be set when CHECKPOINTER_TYPE=postgres. "
+                "Set DATABASE_URL=postgresql://user:pass@host:5432/db"
+            )
+        
+        try:
+            checkpointer = PostgresSaver.from_conn_string(settings.database_url)
+            # Setup the checkpointer tables on first use
+            checkpointer.setup()
+            logger.info("PostgreSQL checkpointer initialized")
+            return checkpointer
+        except Exception as e:
+            logger.error(
+                "Failed to initialize PostgreSQL checkpointer",
+                extra={"error": str(e), "database_url_host": settings.database_url.split("@")[-1] if "@" in settings.database_url else "unknown"}
+            )
+            raise
+    else:
+        # Default to in-memory for development
+        logger.info("Using in-memory checkpointer (development mode)")
+        return InMemorySaver()
+
+
+def create_supervisor_graph(agents: Dict[str, Dict[str, Any]]):
     """Create and compile the supervisor graph for multi-agent orchestration.
     
     Builds a LangGraph supervisor using langgraph_supervisor.create_supervisor
     that coordinates specialized agents through isolated context handoffs.
     
-    Improvements following LangGraph best practices:
-    - Structured routing decisions using RoutingDecision schema
-    - Retry policies for external API calls
-    - Explicit state schema (ChatAppState)
-    - Human-in-the-loop support
+    Architecture:
+        The supervisor uses the following context engineering approach:
+        1. Custom handoff tools pass only task descriptions to subagents
+        2. pre_model_hook trims messages and injects dynamic context
+        3. Conversation summaries preserve context for long conversations
+        4. User memories provide personalization via semantic search
+    
+    LangGraph Best Practices Applied:
+        - TypedDict state schema with reducers
+        - Immutable state updates (never mutate state)
+        - Explicit checkpointer for persistence
+        - Isolated subagent context (no conversation history pollution)
     
     Args:
         agents: Dictionary from get_all_agents() mapping agent names
@@ -436,37 +602,60 @@ def create_supervisor_graph(agents):
         - Otherwise: Uses OpenAI API with gpt-4o
         
     Graph Options:
-        - pre_model_hook: Injects dynamic system prompt
+        - pre_model_hook: Injects dynamic system prompt and trims messages
         - add_handoff_back_messages: False (isolated context)
         - output_mode: "last_message" (returns final supervisor response)
         - parallel_tool_calls: False (sequential agent execution)
-        - retry_policy: Applied to agent handoff nodes
+        - checkpointer: PostgreSQL or in-memory based on config
+        
+    Last Grunted: 02/04/2026 06:30:00 PM PST
     """
     # Create custom handoff tools for isolated context
     handoff_tools = create_isolated_handoff_tools(agents)
     
-    # Configure model for supervisor - use NIM if OPENAI_BASE_URL is set
+    # Configure model for supervisor
+    # Uses NIM endpoint if OPENAI_BASE_URL is set, otherwise OpenAI API
     if OPENAI_BASE_URL:
         model_name = NIM_MODEL_NAME if NIM_MODEL_NAME else "gpt-4o"
         os.environ.setdefault("OPENAI_BASE_URL", OPENAI_BASE_URL)
-        supervisor_model = init_chat_model(f"openai:{model_name}", tags=["supervisor"])
+        supervisor_model = init_chat_model(
+            f"openai:{model_name}",
+            temperature=0.0,
+            tags=["supervisor"]
+        )
     else:
-        supervisor_model = init_chat_model("openai:gpt-4o", tags=["supervisor"])
+        supervisor_model = init_chat_model(
+            "openai:gpt-4o",
+            temperature=0.0,
+            tags=["supervisor"]
+        )
     
-    # Create structured LLM for routing decisions
-    structured_supervisor = supervisor_model.with_structured_output(RoutingDecisionSchema)
+    logger.info(
+        "Creating supervisor graph",
+        extra={
+            "agent_count": len(agents),
+            "agents": list(agents.keys()),
+            "model": "gpt-4o" if not OPENAI_BASE_URL else NIM_MODEL_NAME
+        }
+    )
     
     supervisor = create_supervisor(
         model=supervisor_model,
         agents=[agents[name]["agent"] for name in agents],
         tools=handoff_tools,
-        prompt=None,
+        prompt=None,  # System prompt is built dynamically in pre_model_hook
         pre_model_hook=pre_model_hook,
-        add_handoff_back_messages=False,
-        output_mode="last_message",
-        parallel_tool_calls=False,
+        add_handoff_back_messages=False,  # Isolated context - no history to subagents
+        output_mode="last_message",  # Return only the final supervisor response
+        parallel_tool_calls=False,  # Sequential agent execution
     )
     
-    # Compile with retry policies
-    # Note: LangGraph Server handles persistence automatically, no checkpointer needed
-    return supervisor.compile()
+    # Get configured checkpointer (PostgreSQL for production, in-memory for dev)
+    checkpointer = get_checkpointer()
+    
+    # Compile with explicit checkpointer for thread persistence
+    compiled_graph = supervisor.compile(checkpointer=checkpointer)
+    
+    logger.info("Supervisor graph compiled successfully")
+    
+    return compiled_graph

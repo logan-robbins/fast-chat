@@ -19,28 +19,38 @@ The Responses API provides stateful model interactions with:
 
 Reference: https://platform.openai.com/docs/api-reference/responses
 
-Last Grunted: 02/03/2026 11:45:00 AM UTC
+Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+import base64
+import json
+import logging
+import secrets
+import time
+from typing import List, Optional, Union, Dict, Any, Literal
+
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import List, Optional, Union, Dict, Any, Literal
-from pydantic import BaseModel, Field
-import httpx
-import os
-import json
-import time
-import secrets
-import base64
 
 from src.db.engine import get_session
 from src.db.models import Response, ResponseInputItem
+from src.services.http_client import get_client, CHAT_APP_URL
+from src.services.tokens import count_tokens, count_input_tokens
+from src.services.errors import (
+    create_error_response,
+    model_not_found_error,
+    resource_not_found_error,
+    invalid_parameter_error,
+    backend_error,
+    timeout_error,
+    internal_error,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# Backend configuration
-CHAT_APP_URL = os.getenv("CHAT_APP_URL", "http://localhost:8001/v1/chat/completions")
 
 
 # ============================================================================
@@ -235,6 +245,16 @@ class TextConfig(BaseModel):
     format: Optional[dict] = Field(default_factory=lambda: {"type": "text"})
 
 
+class StreamOptionsResponse(BaseModel):
+    """
+    Streaming options for controlling token usage reporting in Responses API.
+    
+    Attributes:
+        include_usage: If true, includes token usage in the final streaming event.
+    """
+    include_usage: bool = False
+
+
 class CreateResponseRequest(BaseModel):
     """
     Request body for POST /v1/responses.
@@ -251,6 +271,7 @@ class CreateResponseRequest(BaseModel):
         tool_choice: Tool selection strategy. Default "auto".
         store: Whether to store response. Default True.
         stream: Whether to stream response. Default False.
+        stream_options: Options for streaming (include_usage). Optional.
         temperature: Sampling temperature (0-2). Default 1.0.
         top_p: Nucleus sampling (0-1). Default 1.0.
         max_output_tokens: Maximum output tokens. Optional.
@@ -262,7 +283,7 @@ class CreateResponseRequest(BaseModel):
         text: Text output config. Optional.
         include: Additional output data to include. Optional.
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 06:30:00 PM UTC
     """
     model: str
     input: Optional[Union[str, List[Union[MessageInputItem, dict]]]] = None
@@ -273,6 +294,7 @@ class CreateResponseRequest(BaseModel):
     tool_choice: Optional[Union[str, dict]] = "auto"
     store: bool = True
     stream: bool = False
+    stream_options: Optional[StreamOptionsResponse] = None
     temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     max_output_tokens: Optional[int] = None
@@ -470,6 +492,22 @@ class InputTokensResponse(BaseModel):
 
 
 # ============================================================================
+# Valid Models Configuration
+# ============================================================================
+
+VALID_RESPONSE_MODELS: set[str] = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "gpt-5",
+    "o1",
+    "o1-pro",
+    "o3",
+    "o3-mini",
+}
+
+
+# ============================================================================
 # Utility Functions
 # ============================================================================
 
@@ -482,7 +520,7 @@ def generate_response_id() -> str:
     Returns:
         str: Response ID like "resp_67ccd2bed1ec8190b14f964abc054267"
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     return f"resp_{secrets.token_hex(24)}"
 
@@ -496,7 +534,7 @@ def generate_message_id() -> str:
     Returns:
         str: Message ID like "msg_67ccd2bf17f0819081ff3bb2cf6508e6"
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     return f"msg_{secrets.token_hex(24)}"
 
@@ -510,143 +548,9 @@ def generate_compaction_id() -> str:
     Returns:
         str: Compaction ID like "cmp_67ccd2bf17f0819081ff3bb2cf6508e6"
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     return f"cmp_{secrets.token_hex(24)}"
-
-
-def estimate_tokens(text: str) -> int:
-    """
-    Estimate token count for text using character-based heuristic.
-    
-    OpenAI models use ~4 characters per token on average for English.
-    For production, integrate tiktoken library for accuracy.
-    
-    Formula: tokens ≈ characters / 4
-    
-    Args:
-        text: Text to estimate tokens for
-        
-    Returns:
-        int: Estimated token count (minimum 1 for non-empty)
-        
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
-    """
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
-
-
-def count_input_tokens(
-    input_data: Optional[Union[str, List[Any]]],
-    instructions: Optional[str] = None,
-    tools: Optional[List[dict]] = None
-) -> int:
-    """
-    Count estimated input tokens for a response request.
-    
-    Includes tokens from:
-    - Input text/messages
-    - System instructions
-    - Tool definitions
-    - Message structure overhead (~4 tokens per message)
-    
-    Args:
-        input_data: String or list of input items
-        instructions: System/developer message
-        tools: List of tool definitions
-        
-    Returns:
-        int: Estimated total input tokens
-        
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
-    """
-    total = 0
-    
-    # Count instructions
-    if instructions:
-        total += estimate_tokens(instructions) + 4  # +4 for message overhead
-    
-    # Count input
-    if isinstance(input_data, str):
-        total += estimate_tokens(input_data) + 4
-    elif isinstance(input_data, list):
-        for item in input_data:
-            total += 4  # Message overhead
-            if isinstance(item, dict):
-                content = item.get("content", "")
-                if isinstance(content, str):
-                    total += estimate_tokens(content)
-                elif isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict):
-                            text = c.get("text", "")
-                            if text:
-                                total += estimate_tokens(text)
-            elif hasattr(item, "content"):
-                content = item.content
-                if isinstance(content, str):
-                    total += estimate_tokens(content)
-    
-    # Count tools
-    if tools:
-        for tool in tools:
-            # Rough estimate: tool definition ~50-100 tokens
-            total += 50
-            if isinstance(tool, dict):
-                desc = tool.get("description", "")
-                if desc:
-                    total += estimate_tokens(desc)
-    
-    # Add base overhead
-    total += 3  # Priming tokens
-    
-    return total
-
-
-def create_error_response(
-    message: str,
-    error_type: str = "invalid_request_error",
-    param: Optional[str] = None,
-    code: Optional[str] = None,
-    status_code: int = 400
-) -> JSONResponse:
-    """
-    Create an OpenAI-style error response.
-    
-    OpenAI Error Format:
-    {
-        "error": {
-            "message": "Description",
-            "type": "error_type",
-            "param": "parameter",
-            "code": "error_code"
-        }
-    }
-    
-    Args:
-        message: Human-readable error description
-        error_type: Error category
-        param: Parameter that caused error (nullable)
-        code: Machine-readable error code (nullable)
-        status_code: HTTP status code
-        
-    Returns:
-        JSONResponse with OpenAI error format
-        
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
-    """
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "message": message,
-                "type": error_type,
-                "param": param,
-                "code": code
-            }
-        }
-    )
 
 
 def extract_text_from_input(input_data: Optional[Union[str, List[Any]]]) -> str:
@@ -762,48 +666,44 @@ async def create_response(
         POST /v1/responses
         {"model": "gpt-4o", "input": "Hello!"}
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     # Generate IDs and timestamps
     response_id = generate_response_id()
     message_id = generate_message_id()
     created_at = int(time.time())
     
-    # Validate model
-    valid_models = ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-5", "o1", "o3", "o1-pro", "o3-mini"]
-    model_base = request.model.split("-")[0] if "-" in request.model else request.model
-    # Allow model versions like gpt-4o-2024-08-06
-    if not any(request.model.startswith(m) for m in valid_models):
-        return create_error_response(
-            message=f"The model '{request.model}' does not exist or you do not have access to it.",
-            error_type="invalid_request_error",
-            param="model",
-            code="model_not_found",
-            status_code=404
-        )
+    # Validate model - allow model versions like gpt-4o-2024-08-06
+    if not any(request.model.startswith(m) for m in VALID_RESPONSE_MODELS):
+        return model_not_found_error(request.model)
     
     # Validate metadata (max 16 pairs)
     if request.metadata and len(request.metadata) > 16:
-        return create_error_response(
-            message="metadata cannot have more than 16 key-value pairs",
-            error_type="invalid_request_error",
+        return invalid_parameter_error(
             param="metadata",
+            message="metadata cannot have more than 16 key-value pairs",
             code="invalid_metadata"
         )
     
     # Build context from previous response
-    context_items = []
+    context_items: list[dict] = []
     if request.previous_response_id:
         previous = await session.get(Response, request.previous_response_id)
         if not previous:
-            return create_error_response(
-                message=f"Previous response '{request.previous_response_id}' not found",
-                error_type="invalid_request_error",
-                param="previous_response_id",
-                code="response_not_found",
-                status_code=404
+            return resource_not_found_error(
+                "response",
+                request.previous_response_id,
+                "previous_response_id"
             )
         context_items = await get_previous_context(session, request.previous_response_id)
+    
+    logger.info(
+        "responses.create.start",
+        response_id=response_id,
+        model=request.model,
+        stream=request.stream,
+        has_previous=request.previous_response_id is not None
+    )
     
     # Handle streaming
     if request.stream:
@@ -828,13 +728,28 @@ async def _handle_streaming_response(
     """
     Handle streaming response via SSE.
     
-    Emits events:
-    - response.created
-    - response.in_progress
-    - response.output_item.added
-    - response.output_text.delta
-    - response.output_item.done
-    - response.completed
+    Emits OpenAI Responses API events:
+    - response.created: Response started
+    - response.in_progress: Processing underway
+    - response.output_item.added: New output item (message)
+    - response.output_text.delta: Incremental text content
+    - response.output_item.done: Output item completed
+    - response.completed: Response finished
+    
+    Extended Events (forwarded from chat-app):
+    - status: User-friendly status updates (ChatGPT/Claude-style)
+        {"type": "thinking" | "tool_start" | "tool_complete" | ..., 
+         "message": "User-friendly status message",
+         "agent": "websearch" | null,
+         "tool": "perplexity_search" | null}
+    - agent_start: Agent routing notifications
+    - progress: Tool progress updates (legacy)
+    
+    Status events allow frontends to show indicators like:
+    - "Thinking..." during reasoning
+    - "Searching the web..." during web search
+    - "Looking through your documents..." during RAG
+    - "Running Python code..." during code interpreter
     
     Args:
         request: Original request
@@ -847,7 +762,7 @@ async def _handle_streaming_response(
     Returns:
         StreamingResponse with text/event-stream media type
         
-    Last Grunted: 02/03/2026 11:45:00 AM UTC
+    Last Grunted: 02/04/2026 08:00:00 PM UTC
     """
     async def stream_generator():
         # Emit response.created
@@ -920,36 +835,80 @@ async def _handle_streaming_response(
         completion_tokens = 0
         
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream("POST", CHAT_APP_URL, json=backend_payload) as response:
-                    if response.status_code != 200:
-                        error_event = {
-                            "type": "response.failed",
-                            "response": {
-                                "id": response_id,
-                                "status": "failed",
-                                "error": {"code": "backend_error", "message": f"Backend returned {response.status_code}"}
-                            }
+            # Use shared HTTP client for connection pooling
+            client = await get_client()
+            async with client.stream("POST", CHAT_APP_URL, json=backend_payload) as response:
+                if response.status_code != 200:
+                    logger.warning(
+                        "responses.streaming.backend_error",
+                        response_id=response_id,
+                        status_code=response.status_code
+                    )
+                    error_event = {
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "status": "failed",
+                            "error": {"code": "backend_error", "message": f"Backend returned {response.status_code}"}
                         }
-                        yield f"event: response.failed\ndata: {json.dumps(error_event)}\n\n"
-                        yield "event: done\ndata: [DONE]\n\n"
-                        return
-                    
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                break
+                    }
+                    yield f"event: response.failed\ndata: {json.dumps(error_event)}\n\n"
+                    yield "event: done\ndata: [DONE]\n\n"
+                    return
+                
+                current_event_type: str | None = None
+                async for line in response.aiter_lines():
+                    # Parse SSE format
+                    if line.startswith("event: "):
+                        current_event_type = line[7:]
+                    elif line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            current_event_type = None
+                            break
+                        
+                        try:
+                            # Handle status events from chat-app (ChatGPT/Claude-style)
+                            if current_event_type == "status":
+                                status_data = json.loads(data)
+                                # Forward status events for rich UI experience
+                                yield f"event: status\ndata: {json.dumps(status_data)}\n\n"
+                                current_event_type = None
+                                continue
                             
-                            try:
-                                chunk_data = json.loads(data)
+                            # Handle other extended events (agent_start, progress)
+                            if current_event_type and current_event_type not in ("message", "token"):
+                                event_data = json.loads(data)
+                                yield f"event: {current_event_type}\ndata: {json.dumps(event_data)}\n\n"
+                                current_event_type = None
+                                continue
+                            
+                            chunk_data = json.loads(data)
+                            
+                            # Handle token events from chat-app
+                            if chunk_data.get("type") == "token":
+                                content = chunk_data.get("content", "")
+                                if content:
+                                    full_content.append(content)
+                                    completion_tokens += count_tokens(content, request.model)
+                                    
+                                    # Emit as Responses API text delta
+                                    delta_event = {
+                                        "type": "response.output_text.delta",
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": content
+                                    }
+                                    yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
+                            else:
+                                # Handle OpenAI-format streaming chunks
                                 choices = chunk_data.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     content = delta.get("content")
                                     if content:
                                         full_content.append(content)
-                                        completion_tokens += estimate_tokens(content)
+                                        completion_tokens += count_tokens(content, request.model)
                                         
                                         # Emit text delta
                                         delta_event = {
@@ -959,10 +918,17 @@ async def _handle_streaming_response(
                                             "delta": content
                                         }
                                         yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
-                            except json.JSONDecodeError:
-                                pass
-                                
+                        except json.JSONDecodeError:
+                            pass
+                        
+                        current_event_type = None
+                            
         except Exception as e:
+            logger.exception(
+                "responses.streaming.error",
+                response_id=response_id,
+                error=str(e)
+            )
             error_event = {
                 "type": "response.failed",
                 "response": {
@@ -1144,28 +1110,31 @@ async def _handle_non_streaming_response(
     prompt_tokens = count_input_tokens(request.input, request.instructions,
                                        [t.model_dump() if hasattr(t, 'model_dump') else t for t in (request.tools or [])])
     
+    import httpx
+    
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(CHAT_APP_URL, json=backend_payload)
-            
-            if response.status_code != 200:
-                return create_error_response(
-                    message=f"Backend error: {response.status_code}",
-                    error_type="api_error",
-                    code="backend_error",
-                    status_code=response.status_code
-                )
-            
-            backend_response = response.json()
-            
-            # Extract content
-            content = ""
-            if "choices" in backend_response and backend_response["choices"]:
-                message = backend_response["choices"][0].get("message", {})
-                content = message.get("content", "")
-            
-            completion_tokens = estimate_tokens(content)
-            completed_at = int(time.time())
+        # Use shared HTTP client for connection pooling
+        client = await get_client()
+        response = await client.post(CHAT_APP_URL, json=backend_payload)
+        
+        if response.status_code != 200:
+            logger.warning(
+                "responses.create.backend_error",
+                response_id=response_id,
+                status_code=response.status_code
+            )
+            return backend_error(response.status_code)
+        
+        backend_response = response.json()
+        
+        # Extract content
+        content = ""
+        if "choices" in backend_response and backend_response["choices"]:
+            message = backend_response["choices"][0].get("message", {})
+            content = message.get("content", "")
+        
+        completion_tokens = count_tokens(content, request.model)
+        completed_at = int(time.time())
             
             # Build output
             output = [{
@@ -1248,19 +1217,18 @@ async def _handle_non_streaming_response(
             )
             
     except httpx.TimeoutException:
-        return create_error_response(
-            message="Request to backend timed out",
-            error_type="timeout_error",
-            code="timeout",
-            status_code=504
+        logger.warning(
+            "responses.create.timeout",
+            response_id=response_id
         )
+        return timeout_error("backend request")
     except Exception as e:
-        return create_error_response(
-            message=str(e),
-            error_type="api_error",
-            code="internal_error",
-            status_code=500
+        logger.exception(
+            "responses.create.error",
+            response_id=response_id,
+            error=str(e)
         )
+        return internal_error(str(e))
 
 
 @router.get("/v1/responses/{response_id}")
@@ -1296,13 +1264,7 @@ async def get_response(
     db_response = await session.get(Response, response_id)
     
     if not db_response:
-        return create_error_response(
-            message=f"Response '{response_id}' not found",
-            error_type="invalid_request_error",
-            param="response_id",
-            code="response_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("response", response_id, "response_id")
     
     # Build usage object
     usage = None
@@ -1369,13 +1331,7 @@ async def delete_response(
     db_response = await session.get(Response, response_id)
     
     if not db_response:
-        return create_error_response(
-            message=f"Response '{response_id}' not found",
-            error_type="invalid_request_error",
-            param="response_id",
-            code="response_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("response", response_id, "response_id")
     
     # Delete associated input items
     result = await session.execute(
@@ -1419,30 +1375,20 @@ async def cancel_response(
     db_response = await session.get(Response, response_id)
     
     if not db_response:
-        return create_error_response(
-            message=f"Response '{response_id}' not found",
-            error_type="invalid_request_error",
-            param="response_id",
-            code="response_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("response", response_id, "response_id")
     
     if not db_response.background:
-        return create_error_response(
-            message="Only background responses can be cancelled",
-            error_type="invalid_request_error",
+        return invalid_parameter_error(
             param="response_id",
-            code="not_cancellable",
-            status_code=400
+            message="Only background responses can be cancelled",
+            code="not_cancellable"
         )
     
     if db_response.status not in ["in_progress", "queued"]:
-        return create_error_response(
-            message=f"Response with status '{db_response.status}' cannot be cancelled",
-            error_type="invalid_request_error",
+        return invalid_parameter_error(
             param="response_id",
-            code="invalid_status",
-            status_code=400
+            message=f"Response with status '{db_response.status}' cannot be cancelled",
+            code="invalid_status"
         )
     
     # Update status to cancelled
@@ -1630,13 +1576,7 @@ async def list_input_items(
     # Verify response exists
     db_response = await session.get(Response, response_id)
     if not db_response:
-        return create_error_response(
-            message=f"Response '{response_id}' not found",
-            error_type="invalid_request_error",
-            param="response_id",
-            code="response_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("response", response_id, "response_id")
     
     # Build query
     query = select(ResponseInputItem).where(ResponseInputItem.response_id == response_id)

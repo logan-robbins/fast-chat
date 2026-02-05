@@ -9,6 +9,8 @@ services:
   # -------------------------------------------------------------------------
   # chat-api Service - OpenAI-compatible BFF API
   # -------------------------------------------------------------------------
+  # chat-api owns the vector store (ChromaDB). chat-app calls chat-api
+  # for search operations via /v1/search endpoint.
   chat-api:
     build:
       context: .
@@ -19,6 +21,7 @@ services:
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CHROMA_PERSIST_DIR=/app/data/chroma
     volumes:
       - api_data:/app/data
     networks:
@@ -36,20 +39,22 @@ services:
   # -------------------------------------------------------------------------
   # chat-app Service - LangGraph Multi-Agent Orchestrator
   # -------------------------------------------------------------------------
+  # chat-app calls chat-api for vector search operations (RAG).
+  # It does NOT have direct access to ChromaDB.
   chat-app:
     build:
       context: ./chat-app
       dockerfile: Dockerfile
     container_name: fastchat-chat-app
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.0}
       - REDIS_HOST=redis
-      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - CHAT_API_URL=http://chat-api:8000
     volumes:
       - app_data:/app/data
     networks:
@@ -62,6 +67,8 @@ services:
       retries: 3
     restart: unless-stopped
     depends_on:
+      chat-api:
+        condition: service_healthy
       redis:
         condition: service_healthy
 

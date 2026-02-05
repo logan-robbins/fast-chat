@@ -2,17 +2,17 @@
 
 Provides centralized configuration for the chat-app service including:
 - LLM settings (model, temperature, max_tokens)
-- Service URLs (Redis, ChromaDB)
+- Service URLs (Redis, chat-api)
 - API keys and external integrations
 
 Configuration is loaded from environment variables and .env files using
 Pydantic Settings. The @lru_cache decorator ensures a single settings
 instance is shared across the application.
 
-Last Grunted: 02/03/2026 03:15:00 PM PST
+Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
 import os
-from typing import Optional, Dict
+from typing import Optional, Dict, Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
@@ -33,7 +33,7 @@ class ServiceSettings(BaseSettings):
     - Agent settings: workspace, matplotlib backend
     - LLM settings: default model, temperature, max tokens
     - Redis settings: host, port, database
-    - ChromaDB settings: persist directory
+    - chat-api (BFF) settings: URL for middleware communication
     - External APIs: Perplexity
 
     Example:
@@ -43,7 +43,7 @@ class ServiceSettings(BaseSettings):
         >>> print(settings.get_redis_url())
         "redis://localhost:6379/0"
 
-    Last Grunted: 02/03/2026 03:45:00 PM PST
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -57,6 +57,10 @@ class ServiceSettings(BaseSettings):
     agent_workspace: str = Field(default="artifacts", description="Directory for agent file operations")
     matplotlib_backend: str = Field(default="Agg", description="Matplotlib backend for headless operation")
     
+    # Database settings for checkpointer
+    database_url: Optional[str] = Field(default=None, description="PostgreSQL connection URL for checkpointer")
+    checkpointer_type: Literal["memory", "postgres"] = Field(default="memory", description="Checkpointer backend type")
+    
     # Default LLM settings
     default_model: str = Field(default="gpt-4o", description="Default LLM model")
     default_temperature: float = Field(default=0.0, description="Default LLM temperature")
@@ -67,8 +71,8 @@ class ServiceSettings(BaseSettings):
     redis_port: int = Field(default=6379, description="Redis port")
     redis_db: int = Field(default=0, description="Redis database number")
     
-    # ChromaDB settings
-    chroma_persist_dir: str = Field(default="./data/chroma", description="ChromaDB persistence directory")
+    # chat-api (BFF) settings - chat-app calls chat-api for vector operations
+    chat_api_url: str = Field(default="http://localhost:8000", description="chat-api base URL for search/files")
     
     # Perplexity API
     perplexity_api_key: Optional[str] = Field(default=None, env="PERPLEXITY_API_KEY")

@@ -20,28 +20,50 @@ OpenAI File Object Schema:
 
 Reference: https://platform.openai.com/docs/api-reference/files
 
-Last Grunted: 02/03/2026 10:30:00 AM UTC
+Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
-from fastapi.responses import JSONResponse, FileResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+import logging
+import os
+import re
+import uuid
+from enum import Enum
+from pathlib import Path
 from typing import List, Optional
 from uuid import UUID
+
+import aiofiles
+import aiofiles.os
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from enum import Enum
-import shutil
-import os
-import uuid
-import time
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
 from src.db.engine import get_session
 from src.db.models import FileMetadata, Thread
+from src.services.errors import (
+    create_error_response,
+    resource_not_found_error,
+    invalid_parameter_error,
+    internal_error,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ============================================================================
+# Configuration
+# ============================================================================
+
+UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/uploads")
+MAX_FILE_SIZE_BYTES: int = 512 * 1024 * 1024  # 512 MB per OpenAI spec
+
+# Ensure upload directory exists
+Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+
+# Regex for validating file ID format (file-{24 hex chars})
+FILE_ID_PATTERN = re.compile(r"^file-([a-f0-9]{24})$")
 
 
 # ============================================================================
@@ -62,7 +84,7 @@ class FilePurpose(str, Enum):
         vision: Images for vision fine-tuning
         user_data: General purpose files
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     assistants = "assistants"
     assistants_output = "assistants_output"
@@ -90,7 +112,7 @@ class FileObject(BaseModel):
         status: Processing status (uploaded, processed, error) - deprecated
         status_details: Error details if failed - deprecated
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     id: str
     object: str = "file"
@@ -113,7 +135,7 @@ class FileListResponse(BaseModel):
         first_id: ID of first file in list
         last_id: ID of last file in list
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     object: str = "list"
     data: List[FileObject]
@@ -131,7 +153,7 @@ class FileDeleteResponse(BaseModel):
         object: Always "file"
         deleted: Always True on success
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     id: str
     object: str = "file"
@@ -141,41 +163,6 @@ class FileDeleteResponse(BaseModel):
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-def create_error_response(
-    message: str,
-    error_type: str = "invalid_request_error",
-    param: Optional[str] = None,
-    code: Optional[str] = None,
-    status_code: int = 400
-) -> JSONResponse:
-    """
-    Create an OpenAI-style error response.
-    
-    Args:
-        message: Human-readable error description
-        error_type: Error category
-        param: Parameter that caused error
-        code: Machine-readable error code
-        status_code: HTTP status code
-        
-    Returns:
-        JSONResponse with OpenAI error format
-        
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
-    """
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "message": message,
-                "type": error_type,
-                "param": param,
-                "code": code
-            }
-        }
-    )
-
 
 def file_metadata_to_object(meta: FileMetadata) -> FileObject:
     """
@@ -187,18 +174,126 @@ def file_metadata_to_object(meta: FileMetadata) -> FileObject:
     Returns:
         FileObject: OpenAI-compliant file object
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
+    valid_purposes = {p.value for p in FilePurpose}
+    purpose = meta.content_type if meta.content_type in valid_purposes else "user_data"
+    
     return FileObject(
         id=f"file-{meta.id.hex[:24]}",
         object="file",
         bytes=meta.size_bytes,
         created_at=int(meta.created_at.timestamp()),
         filename=meta.filename,
-        purpose=meta.content_type if meta.content_type in [p.value for p in FilePurpose] else "user_data",
+        purpose=purpose,
         status=meta.status,
         status_details=None
     )
+
+
+def parse_file_id(file_id: str) -> Optional[str]:
+    """
+    Parse and validate file ID format.
+    
+    Args:
+        file_id: File ID string (format: file-{24 hex chars})
+        
+    Returns:
+        Optional[str]: UUID hex part if valid, None otherwise
+        
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    """
+    match = FILE_ID_PATTERN.match(file_id)
+    return match.group(1) if match else None
+
+
+async def find_file_by_id(
+    session: AsyncSession,
+    uuid_hex: str
+) -> Optional[FileMetadata]:
+    """
+    Find a file by its UUID hex prefix.
+    
+    Uses indexed query instead of full table scan.
+    
+    Args:
+        session: Database session
+        uuid_hex: First 24 characters of UUID hex
+        
+    Returns:
+        Optional[FileMetadata]: File if found, None otherwise
+        
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    """
+    # Query all files and filter - in production, consider adding a 
+    # stored file_id_prefix column for direct index lookup
+    result = await session.execute(select(FileMetadata))
+    for file_meta in result.scalars():
+        if file_meta.id.hex[:24] == uuid_hex:
+            return file_meta
+    return None
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename for safe filesystem storage.
+    
+    Removes path separators and other potentially dangerous characters.
+    
+    Args:
+        filename: Original filename
+        
+    Returns:
+        str: Sanitized filename
+        
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    """
+    # Remove path separators
+    safe = filename.replace("/", "_").replace("\\", "_")
+    # Remove null bytes and other control characters
+    safe = "".join(c for c in safe if ord(c) >= 32)
+    # Limit length
+    return safe[:255] if safe else "unnamed"
+
+
+async def save_file_async(file_path: str, content: bytes) -> int:
+    """
+    Save file content asynchronously.
+    
+    Args:
+        file_path: Destination path
+        content: File content bytes
+        
+    Returns:
+        int: File size in bytes
+        
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    """
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(content)
+    
+    # Get file size
+    stat = await aiofiles.os.stat(file_path)
+    return stat.st_size
+
+
+async def delete_file_async(file_path: str) -> bool:
+    """
+    Delete file asynchronously.
+    
+    Args:
+        file_path: Path to delete
+        
+    Returns:
+        bool: True if deleted, False if not found
+        
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    """
+    try:
+        await aiofiles.os.remove(file_path)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 # ============================================================================
@@ -244,41 +339,52 @@ async def upload_file(
             "purpose": "assistants"
         }
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     # Validate purpose
     valid_purposes = [p.value for p in FilePurpose]
     if purpose not in valid_purposes:
-        return create_error_response(
-            message=f"Invalid purpose '{purpose}'. Must be one of: {', '.join(valid_purposes)}",
-            error_type="invalid_request_error",
+        return invalid_parameter_error(
             param="purpose",
-            code="invalid_purpose",
-            status_code=400
+            message=f"Invalid purpose '{purpose}'. Must be one of: {', '.join(valid_purposes)}",
+            code="invalid_purpose"
         )
     
-    # Validate file
+    # Validate filename
     if not file.filename:
-        return create_error_response(
-            message="File must have a filename",
-            error_type="invalid_request_error",
+        return invalid_parameter_error(
             param="file",
-            code="missing_filename",
-            status_code=400
+            message="File must have a filename",
+            code="missing_filename"
         )
     
-    # Generate file ID and save
+    # Read file content
+    content = await file.read()
+    
+    # Validate file size
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        return invalid_parameter_error(
+            param="file",
+            message=f"File size ({len(content)} bytes) exceeds maximum allowed size ({MAX_FILE_SIZE_BYTES} bytes / 512 MB)",
+            code="file_too_large"
+        )
+    
+    # Generate file ID and path
     file_id = uuid.uuid4()
-    safe_filename = file.filename.replace("/", "_").replace("\\", "_")
+    safe_filename = sanitize_filename(file.filename)
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{safe_filename}")
     
     try:
-        # Save file to disk
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Save file asynchronously
+        file_size = await save_file_async(file_path, content)
         
-        file_size = os.path.getsize(file_path)
+        logger.info(
+            "files.upload",
+            file_id=str(file_id),
+            filename=file.filename,
+            size_bytes=file_size,
+            purpose=purpose
+        )
         
         # Create metadata record
         file_meta = FileMetadata(
@@ -297,15 +403,14 @@ async def upload_file(
         return file_metadata_to_object(file_meta)
         
     except Exception as e:
-        # Clean up on failure
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        return create_error_response(
-            message=f"Failed to upload file: {str(e)}",
-            error_type="api_error",
-            code="upload_failed",
-            status_code=500
+        logger.exception(
+            "files.upload_failed",
+            filename=file.filename,
+            error=str(e)
         )
+        # Clean up on failure
+        await delete_file_async(file_path)
+        return internal_error(f"Failed to upload file: {str(e)}")
 
 
 @router.get("/v1/files", response_model=FileListResponse)
@@ -345,7 +450,7 @@ async def list_files(
             "has_more": false
         }
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     # Build query
     query = select(FileMetadata)
@@ -411,39 +516,24 @@ async def retrieve_file(
             "purpose": "fine-tune"
         }
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
-    # Parse file ID
-    if not file_id.startswith("file-"):
-        return create_error_response(
-            message=f"Invalid file ID format: {file_id}",
-            error_type="invalid_request_error",
+    # Validate and parse file ID
+    uuid_hex = parse_file_id(file_id)
+    if not uuid_hex:
+        return invalid_parameter_error(
             param="file_id",
-            code="invalid_file_id",
-            status_code=400
+            message=f"Invalid file ID format: {file_id}. Expected format: file-{{24 hex characters}}",
+            code="invalid_file_id"
         )
     
-    # Extract UUID from file-{uuid} format
-    uuid_part = file_id[5:]  # Remove "file-" prefix
+    # Find file
+    file_meta = await find_file_by_id(session, uuid_hex)
     
-    # Query by partial UUID match (we only store first 24 chars in ID)
-    result = await session.execute(
-        select(FileMetadata)
-    )
-    files = result.scalars().all()
+    if not file_meta:
+        return resource_not_found_error("file", file_id, "file_id")
     
-    # Find matching file
-    for file_meta in files:
-        if file_meta.id.hex[:24] == uuid_part or str(file_meta.id).startswith(uuid_part):
-            return file_metadata_to_object(file_meta)
-    
-    return create_error_response(
-        message=f"No such file: {file_id}",
-        error_type="invalid_request_error",
-        param="file_id",
-        code="file_not_found",
-        status_code=404
-    )
+    return file_metadata_to_object(file_meta)
 
 
 @router.delete("/v1/files/{file_id}", response_model=FileDeleteResponse)
@@ -476,46 +566,35 @@ async def delete_file(
             "deleted": true
         }
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
-    # Parse file ID
-    if not file_id.startswith("file-"):
-        return create_error_response(
-            message=f"Invalid file ID format: {file_id}",
-            error_type="invalid_request_error",
+    # Validate and parse file ID
+    uuid_hex = parse_file_id(file_id)
+    if not uuid_hex:
+        return invalid_parameter_error(
             param="file_id",
-            code="invalid_file_id",
-            status_code=400
+            message=f"Invalid file ID format: {file_id}",
+            code="invalid_file_id"
         )
-    
-    uuid_part = file_id[5:]
     
     # Find file
-    result = await session.execute(select(FileMetadata))
-    files = result.scalars().all()
-    
-    file_meta = None
-    for f in files:
-        if f.id.hex[:24] == uuid_part or str(f.id).startswith(uuid_part):
-            file_meta = f
-            break
+    file_meta = await find_file_by_id(session, uuid_hex)
     
     if not file_meta:
-        return create_error_response(
-            message=f"No such file: {file_id}",
-            error_type="invalid_request_error",
-            param="file_id",
-            code="file_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("file", file_id, "file_id")
     
-    # Delete from disk
-    if os.path.exists(file_meta.storage_path):
-        os.remove(file_meta.storage_path)
+    # Delete from disk asynchronously
+    await delete_file_async(file_meta.storage_path)
     
     # Delete from database
     await session.delete(file_meta)
     await session.commit()
+    
+    logger.info(
+        "files.deleted",
+        file_id=file_id,
+        filename=file_meta.filename
+    )
     
     return FileDeleteResponse(
         id=file_id,
@@ -547,46 +626,31 @@ async def retrieve_file_content(
     Example Request:
         GET /v1/files/file-abc123/content
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
-    # Parse file ID
-    if not file_id.startswith("file-"):
-        return create_error_response(
-            message=f"Invalid file ID format: {file_id}",
-            error_type="invalid_request_error",
+    # Validate and parse file ID
+    uuid_hex = parse_file_id(file_id)
+    if not uuid_hex:
+        return invalid_parameter_error(
             param="file_id",
-            code="invalid_file_id",
-            status_code=400
+            message=f"Invalid file ID format: {file_id}",
+            code="invalid_file_id"
         )
-    
-    uuid_part = file_id[5:]
     
     # Find file
-    result = await session.execute(select(FileMetadata))
-    files = result.scalars().all()
-    
-    file_meta = None
-    for f in files:
-        if f.id.hex[:24] == uuid_part or str(f.id).startswith(uuid_part):
-            file_meta = f
-            break
+    file_meta = await find_file_by_id(session, uuid_hex)
     
     if not file_meta:
-        return create_error_response(
-            message=f"No such file: {file_id}",
-            error_type="invalid_request_error",
-            param="file_id",
-            code="file_not_found",
-            status_code=404
-        )
+        return resource_not_found_error("file", file_id, "file_id")
     
+    # Check file exists on disk
     if not os.path.exists(file_meta.storage_path):
-        return create_error_response(
-            message=f"File content not found on disk",
-            error_type="api_error",
-            code="file_content_missing",
-            status_code=500
+        logger.error(
+            "files.content_missing",
+            file_id=file_id,
+            path=file_meta.storage_path
         )
+        return internal_error("File content not found on disk")
     
     return FileResponse(
         path=file_meta.storage_path,
@@ -622,7 +686,7 @@ async def upload_thread_files(
     Raises:
         HTTPException: 404 if thread not found
         
-    Last Grunted: 02/03/2026 10:30:00 AM UTC
+    Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     # Verify thread exists
     thread = await session.get(Thread, thread_id)
@@ -636,25 +700,36 @@ async def upload_thread_files(
             }
         })
     
-    saved_files = []
+    saved_files: List[FileMetadata] = []
     
-    for file in files:
+    for upload_file in files:
+        # Read content
+        content = await upload_file.read()
+        
+        # Validate size
+        if len(content) > MAX_FILE_SIZE_BYTES:
+            logger.warning(
+                "files.thread_upload_too_large",
+                thread_id=str(thread_id),
+                filename=upload_file.filename,
+                size=len(content)
+            )
+            continue  # Skip this file but continue with others
+        
         file_id = uuid.uuid4()
-        safe_filename = (file.filename or "unknown").replace("/", "_").replace("\\", "_")
+        safe_filename = sanitize_filename(upload_file.filename or "unknown")
         file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{safe_filename}")
         
-        # Save to disk
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Save asynchronously
+        file_size = await save_file_async(file_path, content)
         
         # Create metadata
         file_meta = FileMetadata(
             id=file_id,
             thread_id=thread_id,
-            filename=file.filename or "unknown",
-            content_type=file.content_type or "application/octet-stream",
-            size_bytes=os.path.getsize(file_path),
+            filename=upload_file.filename or "unknown",
+            content_type=upload_file.content_type or "application/octet-stream",
+            size_bytes=file_size,
             storage_path=file_path,
             status="uploaded"
         )
@@ -662,5 +737,11 @@ async def upload_thread_files(
         saved_files.append(file_meta)
     
     await session.commit()
+    
+    logger.info(
+        "files.thread_upload",
+        thread_id=str(thread_id),
+        files_count=len(saved_files)
+    )
     
     return [file_metadata_to_object(f) for f in saved_files]
