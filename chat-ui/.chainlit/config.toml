@@ -1,0 +1,105 @@
+# =============================================================================
+# Chainlit Configuration - Fast-Chat UI
+# =============================================================================
+# Production configuration for the Chainlit frontend.
+# Documentation: https://docs.chainlit.io/backend/config/overview
+# =============================================================================
+
+[project]
+# Allow cross-origin requests from specified origins
+# In production, set this to your frontend domains
+allow_origins = ["*"]
+
+# Enable telemetry for debugging (disable in production if needed)
+enable_telemetry = false
+
+# Session timeout in seconds (default: 3600 = 1 hour)
+session_timeout = 7200
+
+# Cache directory for temporary files
+cache = false
+
+# User environment variables to pass through
+user_env = []
+
+
+[features]
+# Enable prompt playground for testing (disable in production)
+prompt_playground = false
+
+# Enable human-in-the-loop features
+unsafe_allow_html = false
+
+# Enable LaTeX rendering for mathematical content
+latex = true
+
+# Spontaneous file upload configuration
+[features.spontaneous_file_upload]
+enabled = true
+accept = ["*/*"]
+max_files = 20
+max_size_mb = 500
+
+
+[UI]
+# Application name displayed in header and browser tab
+name = "Fast-Chat"
+
+# Application description for meta tags
+description = "AI-powered chat assistant with web search, document analysis, and code assistance"
+
+# Default theme (light or dark)
+default_theme = "dark"
+
+# Chain of Thought display mode: "hidden", "tool_call", or "full"
+# "tool_call" shows agent steps without internal reasoning
+cot = "tool_call"
+
+# Layout mode: "default" or "wide"
+layout = "wide"
+
+# Custom CSS file (relative to public directory)
+# custom_css = "/public/custom.css"
+
+# Custom JavaScript file
+# custom_js = "/public/custom.js"
+
+# Alert style: "classic" or "modern"
+alert_style = "modern"
+
+# GitHub link (optional - remove to hide)
+# github = "https://github.com/your-org/fast-chat"
+
+
+[meta]
+# Meta tags for SEO and social sharing
+generated_by = "Fast-Chat Platform"
+
+
+# =============================================================================
+# Authentication Configuration
+# =============================================================================
+# OAuth is enabled when CHAINLIT_AUTH_SECRET is set and provider env vars exist.
+# 
+# Required: CHAINLIT_AUTH_SECRET (generate with: openssl rand -hex 32)
+#
+# GitHub:
+#   OAUTH_GITHUB_CLIENT_ID
+#   OAUTH_GITHUB_CLIENT_SECRET
+#
+# Google:
+#   OAUTH_GOOGLE_CLIENT_ID
+#   OAUTH_GOOGLE_CLIENT_SECRET
+#
+# Azure AD:
+#   OAUTH_AZURE_AD_CLIENT_ID
+#   OAUTH_AZURE_AD_CLIENT_SECRET
+#   OAUTH_AZURE_AD_TENANT_ID
+#
+# Okta:
+#   OAUTH_OKTA_CLIENT_ID
+#   OAUTH_OKTA_CLIENT_SECRET
+#   OAUTH_OKTA_DOMAIN
+#
+# See: https://docs.chainlit.io/authentication/oauth
+# =============================================================================

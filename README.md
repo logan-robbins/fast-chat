@@ -6,8 +6,13 @@ A production-ready chat platform with multi-agent orchestration, RAG capabilitie
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Client (Web/API)                                │
-│  Receives: tokens, status updates, usage stats, agent transitions           │
+│                              chat-ui (Chainlit)                              │
+│  Production Chainlit Frontend:                                               │
+│  - OAuth/SSO authentication (GitHub, Google, Azure AD, Okta)                 │
+│  - Real-time SSE streaming with status events                                │
+│  - File uploads with drag-and-drop                                           │
+│  - Chat history persistence (SQLAlchemy/PostgreSQL)                          │
+│  - Modern dark theme with professional styling                               │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -49,6 +54,7 @@ A production-ready chat platform with multi-agent orchestration, RAG capabilitie
 
 | Component | Purpose | Port |
 |-----------|---------|------|
+| `chat-ui` | Chainlit frontend with OAuth and SSE streaming | 8080 |
 | `chat-api` | OpenAI-compatible BFF, threads, files, streaming | 8000 |
 | `chat-app` | LangGraph multi-agent orchestrator | 8001 |
 | `docproc` | Document processing library | (library) |
@@ -159,6 +165,21 @@ cd chat-app
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
 langgraph dev
+
+# 5. Install and run chat-ui (separate terminal)
+cd chat-ui
+uv venv --python 3.12 .venv
+uv pip install -e .
+chainlit run app.py --port 8080
+```
+
+### Docker Compose (Recommended)
+
+```bash
+# Run all services with Docker Compose
+docker-compose up
+
+# Access the UI at http://localhost:8080
 ```
 
 ## Key Design Decisions
@@ -230,6 +251,22 @@ OPENAI_API_KEY=sk-...
 ### Optional
 
 ```bash
+# chat-ui (Chainlit Frontend)
+CHAT_API_URL=http://localhost:8000     # URL for chat-api backend
+CHAT_API_TIMEOUT=120.0                 # Request timeout in seconds
+DEFAULT_MODEL=gpt-4o                   # Default model for completions
+CHAINLIT_AUTH_SECRET=                  # Generate with: openssl rand -hex 32
+CHAINLIT_URL=http://localhost:8080     # URL for OAuth callbacks
+
+# OAuth providers (configure at least one for production)
+OAUTH_GITHUB_CLIENT_ID=
+OAUTH_GITHUB_CLIENT_SECRET=
+OAUTH_GOOGLE_CLIENT_ID=
+OAUTH_GOOGLE_CLIENT_SECRET=
+OAUTH_AZURE_AD_CLIENT_ID=
+OAUTH_AZURE_AD_CLIENT_SECRET=
+OAUTH_AZURE_AD_TENANT_ID=
+
 # chat-api (BFF) - owns vector store
 DATABASE_URL=sqlite:///./chat.db
 CHAT_APP_URL=http://localhost:8001/v1/chat/completions

@@ -7,6 +7,45 @@
 
 services:
   # -------------------------------------------------------------------------
+  # chat-ui Service - Chainlit Frontend
+  # -------------------------------------------------------------------------
+  # Production-ready Chainlit frontend with OAuth, SSE streaming, and
+  # chat history persistence. Connects to chat-api for all backend operations.
+  chat-ui:
+    build:
+      context: ./chat-ui
+      dockerfile: Dockerfile
+    container_name: fastchat-chat-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - CHAT_API_URL=http://chat-api:8000
+      - CHAT_API_TIMEOUT=120.0
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
+      - CHAINLIT_URL=${CHAINLIT_URL:-http://localhost:8080}
+      # OAuth providers (optional)
+      - OAUTH_GITHUB_CLIENT_ID=${OAUTH_GITHUB_CLIENT_ID:-}
+      - OAUTH_GITHUB_CLIENT_SECRET=${OAUTH_GITHUB_CLIENT_SECRET:-}
+      - OAUTH_GOOGLE_CLIENT_ID=${OAUTH_GOOGLE_CLIENT_ID:-}
+      - OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET:-}
+      # Database for chat persistence (optional)
+      - DATABASE_URL=${CHAT_UI_DATABASE_URL:-}
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/healthz', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      chat-api:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
   # chat-api Service - OpenAI-compatible BFF API
   # -------------------------------------------------------------------------
   # chat-api owns the vector store (ChromaDB). chat-app calls chat-api
