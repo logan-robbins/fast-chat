@@ -136,7 +136,7 @@ def create_isolated_handoff_tool(
             )
 
         logger.info(
-            f"Handing off to {agent_name}",
+            "Handing off to agent",
             extra={
                 "agent_name": agent_name,
                 "tool_call_id": tool_call_id,
@@ -164,10 +164,10 @@ def create_isolated_handoff_tool(
             }
 
             logger.debug(
-                f"Invoking {agent_name} with isolated state",
+                "Invoking agent with isolated state",
                 extra={
                     "agent_name": agent_name,
-                    "tool_call_id": tool_call_id
+                    "tool_call_id": tool_call_id,
                 }
             )
 
@@ -177,7 +177,7 @@ def create_isolated_handoff_tool(
             result = await agent_instance.ainvoke(isolated_state)
 
             logger.debug(
-                f"Agent {agent_name} invocation completed",
+                "Agent invocation completed",
                 extra={
                     "agent_name": agent_name,
                     "tool_call_id": tool_call_id,
@@ -190,7 +190,7 @@ def create_isolated_handoff_tool(
             final_content = _extract_agent_response(result, agent_name, tool_call_id)
 
             logger.info(
-                f"Received response from {agent_name}",
+                "Received response from agent",
                 extra={
                     "agent_name": agent_name,
                     "tool_call_id": tool_call_id,
@@ -229,7 +229,7 @@ def create_isolated_handoff_tool(
         except Exception as e:
             error_traceback = traceback.format_exc()
             logger.error(
-                f"Error during handoff to {agent_name}",
+                "Error during agent handoff",
                 extra={
                     "agent_name": agent_name,
                     "tool_call_id": tool_call_id,
@@ -295,18 +295,18 @@ def _extract_agent_response(
                 "agent_name": agent_name,
                 "tool_call_id": tool_call_id,
                 "result_type": type(result).__name__,
-                "result_keys": list(result.keys()) if isinstance(result, dict) else None
+                "result_keys": list(result.keys()) if isinstance(result, dict) else None,
             }
         )
         return f"Error: {agent_name} did not return any response"
     
     message_count = len(result["messages"])
     logger.debug(
-        f"Agent returned {message_count} message(s)",
+        "Agent returned messages",
         extra={
             "agent_name": agent_name,
             "tool_call_id": tool_call_id,
-            "message_count": message_count
+            "message_count": message_count,
         }
     )
 

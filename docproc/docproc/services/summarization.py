@@ -20,15 +20,14 @@ Token Estimation:
 - 100K chars ≈ 25K tokens
 - GPT-4o context: 128K tokens
 
-SDK Version (verified 02/03/2026):
-- langchain_openai>=0.0.5: ChatOpenAI with invoke() method
+SDK Version (verified 02/05/2026):
+- langchain_openai>=0.0.5: ChatOpenAI with ainvoke() async method
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
 import asyncio
 import logging
 import os
-from typing import List
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -74,7 +73,7 @@ async def summarize_text_async(
         GPT-4o context = 128K tokens
         25K input + response overhead = safe single call
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     if not text or not text.strip():
         return "Document contains no extractable text."
@@ -112,12 +111,8 @@ Document:
 
 Summary:"""
     
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: llm.invoke(prompt)
-    )
-    
+    response = await llm.ainvoke(prompt)
+
     return response.content.strip()
 
 
@@ -132,8 +127,7 @@ async def _summarize_map_reduce(title: str, text: str, model: str) -> str:
     Only used for documents > 100K characters.
     """
     llm = get_llm_model(model)
-    loop = asyncio.get_running_loop()
-    
+
     # Split into large chunks
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=MAP_CHUNK_SIZE,
@@ -145,10 +139,7 @@ async def _summarize_map_reduce(title: str, text: str, model: str) -> str:
     # Map: Summarize each chunk in parallel
     async def summarize_chunk(chunk: str, idx: int) -> str:
         prompt = f"Summarize this section (part {idx + 1} of {len(chunks)}):\n\n{chunk}\n\nSummary:"
-        response = await loop.run_in_executor(
-            None,
-            lambda: llm.invoke(prompt)
-        )
+        response = await llm.ainvoke(prompt)
         return response.content.strip()
     
     tasks = [summarize_chunk(chunk, i) for i, chunk in enumerate(chunks)]
@@ -167,10 +158,7 @@ async def _summarize_map_reduce(title: str, text: str, model: str) -> str:
 
 Please provide a single, unified summary that captures all key points:"""
     
-    final_response = await loop.run_in_executor(
-        None,
-        lambda: llm.invoke(reduce_prompt)
-    )
+    final_response = await llm.ainvoke(reduce_prompt)
     
     return final_response.content.strip()
 
@@ -206,7 +194,7 @@ async def summarize_single_file(
         Empty or whitespace-only text returns error status immediately
         without calling the LLM.
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     try:
         if not text.strip():

@@ -150,7 +150,7 @@ def handle_transient_error(
         }
     )
     
-    # If we've exceeded max retries, route to error handler
+    # If we've exceeded max retries, store error and route to __end__
     if retry_count >= max_retries:
         logger.error(
             "Max retries exceeded for transient error",
@@ -160,11 +160,20 @@ def handle_transient_error(
                 "max_retries": max_retries
             }
         )
+        from langchain_core.messages import AIMessage
         return Command(
             update={
-                "errors": existing_errors + [error_state]
+                "errors": existing_errors + [error_state],
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "I'm having trouble connecting to an external service right now. "
+                            "Please try again in a moment."
+                        )
+                    )
+                ],
             },
-            goto="handle_max_retries_exceeded"
+            goto="__end__"
         )
     
     # Otherwise, let the retry policy handle it
@@ -314,11 +323,14 @@ def handle_unexpected_error(
     node_name: str,
     error: Exception
 ) -> Command:
-    """Handle unexpected errors by storing and routing to error handler.
+    """Handle unexpected errors by storing in state and routing to __end__.
     
-    Unexpected errors should bubble up to developers for debugging,
-    but we store them in state first for observability. The error is
-    logged with full context before re-raising.
+    Stores the error in state for observability and adds a user-facing
+    error message to the conversation. Returns a Command that routes to
+    __end__ so the user sees the error message rather than experiencing
+    a silent failure.
+    
+    The error is logged with full traceback for developer debugging.
     
     Args:
         state: Current graph state.
@@ -326,13 +338,13 @@ def handle_unexpected_error(
         error: The exception that occurred.
         
     Returns:
-        Command to update state and route to __end__.
+        Command updating state with error info and an AI message,
+        routing to "__end__".
         
-    Raises:
-        Exception: The original error after logging, to bubble up for debugging.
-        
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
+    from langchain_core.messages import AIMessage
+
     error_state = ErrorState(
         node_name=node_name,
         error_type="unexpected",
@@ -342,7 +354,7 @@ def handle_unexpected_error(
     )
     
     logger.error(
-        "Unexpected error occurred - bubbling up for debugging",
+        "Unexpected error occurred",
         extra={
             "node_name": node_name,
             "error_type": type(error).__name__,
@@ -351,22 +363,29 @@ def handle_unexpected_error(
         exc_info=True  # Include full traceback
     )
     
-    # Store error for observability
+    # Store error for observability and add user-facing message
     existing_errors: List[ErrorState] = state.get("errors", [])
     updated_errors = existing_errors + [error_state]
     
-    # Note: Command is created but not returned since we're re-raising.
-    # The state update would be applied if we returned the command instead.
-    # This logs the error context but lets the exception propagate.
-    _ = Command(
+    # Limit error history
+    if len(updated_errors) > MAX_ERRORS_IN_STATE:
+        updated_errors = updated_errors[-MAX_ERRORS_IN_STATE:]
+    
+    return Command(
         update={
-            "errors": updated_errors
+            "errors": updated_errors,
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I encountered an unexpected error while processing your request. "
+                        "The issue has been logged for investigation. "
+                        "Please try again, and if the problem persists, contact support."
+                    )
+                )
+            ],
         },
         goto="__end__"
     )
-    
-    # Re-raise to bubble up for developer debugging
-    raise error
 
 
 def clear_recovered_errors(

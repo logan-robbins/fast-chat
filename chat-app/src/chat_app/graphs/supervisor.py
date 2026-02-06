@@ -1,17 +1,15 @@
 """Supervisor graph creation for multi-agent orchestration with LangGraph best practices.
 
 This module implements the supervisor pattern using LangGraph's create_supervisor
-with improvements following the LangGraph documentation:
-- Explicit TypedDict state schema
-- Structured routing decisions
-- Retry policies for external services
-- Human-in-the-loop support
-- Error handling with state persistence
-- Message trimming and summarization for long conversations
+with improvements following the LangGraph 2026 documentation:
+- Explicit TypedDict state schema (ChatAppState)
+- pre_model_hook for context engineering (trim, summarize, inject memories)
+- Custom isolated handoff tools (agents receive only task descriptions)
+- Checkpointer for durable execution (PostgreSQL or in-memory)
 
 Key components:
 - SUPERVISOR_TEMPLATE: Comprehensive system prompt for routing and synthesis
-- pre_model_hook: Dynamic prompt injection for date/time and file context
+- pre_model_hook: Dynamic prompt injection for date/time, file context, memories
 - create_supervisor_graph: Factory function for the compiled supervisor graph
 
 Architecture:
@@ -25,7 +23,11 @@ Context Engineering:
     - User memories are retrieved via semantic search for personalization
     - File context is injected when documents are uploaded
 
-Last Grunted: 02/04/2026 06:30:00 PM PST
+Graph Topology (after compile):
+    __start__ → supervisor → {websearch, knowledge_base, code_interpreter, __end__}
+    Each agent → supervisor (return to supervisor after execution)
+
+Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
 from datetime import datetime
 import logging
@@ -603,12 +605,13 @@ def create_supervisor_graph(agents: Dict[str, Dict[str, Any]]):
         
     Graph Options:
         - pre_model_hook: Injects dynamic system prompt and trims messages
-        - add_handoff_back_messages: False (isolated context)
+        - state_schema: ChatAppState (explicit TypedDict with reducers)
+        - add_handoff_messages: False (isolated context)
         - output_mode: "last_message" (returns final supervisor response)
         - parallel_tool_calls: False (sequential agent execution)
         - checkpointer: PostgreSQL or in-memory based on config
         
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
     # Create custom handoff tools for isolated context
     handoff_tools = create_isolated_handoff_tools(agents)
@@ -645,7 +648,8 @@ def create_supervisor_graph(agents: Dict[str, Dict[str, Any]]):
         tools=handoff_tools,
         prompt=None,  # System prompt is built dynamically in pre_model_hook
         pre_model_hook=pre_model_hook,
-        add_handoff_back_messages=False,  # Isolated context - no history to subagents
+        state_schema=ChatAppState,  # Explicit TypedDict state schema
+        add_handoff_messages=False,  # Isolated context - no history to subagents
         output_mode="last_message",  # Return only the final supervisor response
         parallel_tool_calls=False,  # Sequential agent execution
     )

@@ -3,7 +3,20 @@
 This module provides validation functions to ensure state consistency
 across node transitions and catches errors early.
 
-Last Grunted: 02/04/2026 03:30:00 PM PST
+Graph Topology (create_supervisor):
+    The supervisor graph created by langgraph_supervisor.create_supervisor
+    produces the following node topology:
+
+    __start__ → supervisor → {websearch, knowledge_base, code_interpreter, __end__}
+    websearch → supervisor
+    knowledge_base → supervisor
+    code_interpreter → supervisor
+    supervisor → __end__
+
+    The supervisor node contains the LLM call loop and tool execution.
+    Agent nodes are subgraphs invoked via handoff tools.
+
+Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
 from typing import List, Dict, Any, Optional, Set
 from langchain_core.messages import BaseMessage
@@ -16,17 +29,16 @@ class StateValidationError(Exception):
     pass
 
 
-# Valid state transitions
-VALID_AGENT_TRANSITIONS = {
-    "__start__": {"classify_intent"},
-    "classify_intent": {"websearch", "knowledge_base", "code_interpreter", "supervisor_direct", "request_clarification"},
-    "websearch": {"supervisor_synthesize", "__end__"},
-    "knowledge_base": {"supervisor_synthesize", "__end__"},
-    "code_interpreter": {"supervisor_synthesize", "request_confirmation", "__end__"},
-    "supervisor_direct": {"__end__"},
-    "supervisor_synthesize": {"__end__", "delegate_to_agent"},
-    "request_clarification": {"classify_intent"},
-    "request_confirmation": {"code_interpreter", "__end__"},
+# Valid state transitions matching actual create_supervisor graph topology.
+# The supervisor uses tool-calling to route to agent subgraph nodes.
+# Agents always return to the supervisor, which then decides to delegate
+# again or respond to the user (__end__).
+VALID_AGENT_TRANSITIONS: Dict[str, Set[str]] = {
+    "__start__": {"supervisor"},
+    "supervisor": {"websearch", "knowledge_base", "code_interpreter", "__end__"},
+    "websearch": {"supervisor"},
+    "knowledge_base": {"supervisor"},
+    "code_interpreter": {"supervisor"},
 }
 
 
@@ -142,17 +154,23 @@ def validate_error_state(error: Any) -> None:
 def validate_state_transition(
     current_node: str,
     next_node: str,
-    valid_transitions: Dict[str, Set[str]] = None
+    valid_transitions: Optional[Dict[str, Set[str]]] = None
 ) -> None:
     """Validate that a state transition is allowed.
     
+    Checks that the transition from current_node to next_node is valid
+    according to the graph topology created by create_supervisor.
+    
     Args:
-        current_node: Current node name
-        next_node: Target node name
-        valid_transitions: Dict of valid transitions (defaults to VALID_AGENT_TRANSITIONS)
+        current_node: Current node name (e.g., "supervisor", "websearch").
+        next_node: Target node name.
+        valid_transitions: Dict of valid transitions. Defaults to
+            VALID_AGENT_TRANSITIONS which matches the create_supervisor topology.
         
     Raises:
-        StateValidationError: If transition is invalid
+        StateValidationError: If the transition is not in the allowed set.
+        
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
     if valid_transitions is None:
         valid_transitions = VALID_AGENT_TRANSITIONS

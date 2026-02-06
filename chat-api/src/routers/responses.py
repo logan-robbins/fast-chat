@@ -23,7 +23,7 @@ Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
 import base64
 import json
-import logging
+import structlog
 import secrets
 import time
 from typing import List, Optional, Union, Dict, Any, Literal
@@ -35,9 +35,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from src.db.engine import get_session
+import httpx
+
 from src.db.models import Response, ResponseInputItem
 from src.services.http_client import get_client, CHAT_APP_URL
-from src.services.tokens import count_tokens, count_input_tokens
+from src.services.model_registry import is_model_supported
+from src.services.tokens import count_tokens, count_input_tokens, estimate_tokens
 from src.services.errors import (
     create_error_response,
     model_not_found_error,
@@ -48,7 +51,7 @@ from src.services.errors import (
     internal_error,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -495,16 +498,8 @@ class InputTokensResponse(BaseModel):
 # Valid Models Configuration
 # ============================================================================
 
-VALID_RESPONSE_MODELS: set[str] = {
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4.1",
-    "gpt-5",
-    "o1",
-    "o1-pro",
-    "o3",
-    "o3-mini",
-}
+# Model validation is handled by the shared model registry
+# (src.services.model_registry.is_model_supported)
 
 
 # ============================================================================
@@ -673,8 +668,8 @@ async def create_response(
     message_id = generate_message_id()
     created_at = int(time.time())
     
-    # Validate model - allow model versions like gpt-4o-2024-08-06
-    if not any(request.model.startswith(m) for m in VALID_RESPONSE_MODELS):
+    # Validate model via shared registry (supports dated variants)
+    if not is_model_supported(request.model):
         return model_not_found_error(request.model)
     
     # Validate metadata (max 16 pairs)
@@ -1037,8 +1032,10 @@ async def _handle_streaming_response(
                 
                 await session.commit()
             except Exception:
-                # Don't fail streaming response if storage fails
-                pass
+                logger.warning(
+                    "responses.streaming.storage_failed",
+                    response_id=response_id,
+                )
     
     return StreamingResponse(
         stream_generator(),
@@ -1109,9 +1106,7 @@ async def _handle_non_streaming_response(
     
     prompt_tokens = count_input_tokens(request.input, request.instructions,
                                        [t.model_dump() if hasattr(t, 'model_dump') else t for t in (request.tools or [])])
-    
-    import httpx
-    
+
     try:
         # Use shared HTTP client for connection pooling
         client = await get_client()
@@ -1135,87 +1130,87 @@ async def _handle_non_streaming_response(
         
         completion_tokens = count_tokens(content, request.model)
         completed_at = int(time.time())
-            
-            # Build output
-            output = [{
-                "type": "message",
-                "id": message_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": content, "annotations": []}]
-            }]
-            
-            usage = UsageObject(
-                input_tokens=prompt_tokens,
-                input_tokens_details={"cached_tokens": 0},
-                output_tokens=completion_tokens,
-                output_tokens_details={"reasoning_tokens": 0},
-                total_tokens=prompt_tokens + completion_tokens
-            )
-            
-            # Store response if requested
-            if request.store:
-                db_response = Response(
-                    id=response_id,
-                    created_at=created_at,
-                    completed_at=completed_at,
-                    status="completed",
-                    model=request.model,
-                    instructions=request.instructions,
-                    output=output,
-                    usage=usage.model_dump(),
-                    response_metadata=request.metadata or {},
-                    previous_response_id=request.previous_response_id,
-                    temperature=request.temperature or 1.0,
-                    top_p=request.top_p or 1.0,
-                    max_output_tokens=request.max_output_tokens,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                    tool_choice=request.tool_choice if isinstance(request.tool_choice, str) else "auto",
-                    tools=[t.model_dump() if hasattr(t, 'model_dump') else t for t in (request.tools or [])],
-                    truncation=request.truncation,
-                    background=request.background
-                )
-                session.add(db_response)
-                
-                # Store input items
-                if request.input:
-                    input_item = ResponseInputItem(
-                        id=generate_message_id(),
-                        response_id=response_id,
-                        type="message",
-                        role="user",
-                        content=[{"type": "input_text", "text": input_text}] if input_text else None,
-                        created_at=created_at
-                    )
-                    session.add(input_item)
-                
-                await session.commit()
-            
-            return ResponseObject(
+
+        # Build output
+        output = [{
+            "type": "message",
+            "id": message_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}]
+        }]
+
+        usage = UsageObject(
+            input_tokens=prompt_tokens,
+            input_tokens_details={"cached_tokens": 0},
+            output_tokens=completion_tokens,
+            output_tokens_details={"reasoning_tokens": 0},
+            total_tokens=prompt_tokens + completion_tokens
+        )
+
+        # Store response if requested
+        if request.store:
+            db_response = Response(
                 id=response_id,
-                object="response",
                 created_at=created_at,
-                status="completed",
                 completed_at=completed_at,
+                status="completed",
                 model=request.model,
-                output=output,
-                usage=usage,
                 instructions=request.instructions,
+                output=output,
+                usage=usage.model_dump(),
+                response_metadata=request.metadata or {},
+                previous_response_id=request.previous_response_id,
+                temperature=request.temperature or 1.0,
+                top_p=request.top_p or 1.0,
                 max_output_tokens=request.max_output_tokens,
                 parallel_tool_calls=request.parallel_tool_calls,
-                previous_response_id=request.previous_response_id,
-                reasoning=request.reasoning,
-                store=request.store,
-                temperature=request.temperature or 1.0,
-                text=request.text,
-                tool_choice=request.tool_choice,
+                tool_choice=request.tool_choice if isinstance(request.tool_choice, str) else "auto",
                 tools=[t.model_dump() if hasattr(t, 'model_dump') else t for t in (request.tools or [])],
-                top_p=request.top_p or 1.0,
                 truncation=request.truncation,
-                metadata=request.metadata or {},  # API uses 'metadata', db uses 'response_metadata'
                 background=request.background
             )
-            
+            session.add(db_response)
+
+            # Store input items
+            if request.input:
+                input_item = ResponseInputItem(
+                    id=generate_message_id(),
+                    response_id=response_id,
+                    type="message",
+                    role="user",
+                    content=[{"type": "input_text", "text": input_text}] if input_text else None,
+                    created_at=created_at
+                )
+                session.add(input_item)
+
+            await session.commit()
+
+        return ResponseObject(
+            id=response_id,
+            object="response",
+            created_at=created_at,
+            status="completed",
+            completed_at=completed_at,
+            model=request.model,
+            output=output,
+            usage=usage,
+            instructions=request.instructions,
+            max_output_tokens=request.max_output_tokens,
+            parallel_tool_calls=request.parallel_tool_calls,
+            previous_response_id=request.previous_response_id,
+            reasoning=request.reasoning,
+            store=request.store,
+            temperature=request.temperature or 1.0,
+            text=request.text,
+            tool_choice=request.tool_choice,
+            tools=[t.model_dump() if hasattr(t, 'model_dump') else t for t in (request.tools or [])],
+            top_p=request.top_p or 1.0,
+            truncation=request.truncation,
+            metadata=request.metadata or {},  # API uses 'metadata', db uses 'response_metadata'
+            background=request.background
+        )
+
     except httpx.TimeoutException:
         logger.warning(
             "responses.create.timeout",

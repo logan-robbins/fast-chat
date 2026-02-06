@@ -22,7 +22,7 @@ Reference: https://platform.openai.com/docs/api-reference/files
 
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
-import logging
+import structlog
 import os
 import re
 import uuid
@@ -48,7 +48,7 @@ from src.services.errors import (
     internal_error,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -209,29 +209,38 @@ def parse_file_id(file_id: str) -> Optional[str]:
 
 async def find_file_by_id(
     session: AsyncSession,
-    uuid_hex: str
+    uuid_hex: str,
 ) -> Optional[FileMetadata]:
-    """
-    Find a file by its UUID hex prefix.
-    
-    Uses indexed query instead of full table scan.
-    
+    """Find a file by its UUID hex prefix using an indexed range query.
+
+    Constructs lower and upper UUID bounds from the 24-char hex prefix
+    and performs a primary-key range scan, avoiding a full table scan.
+
     Args:
-        session: Database session
-        uuid_hex: First 24 characters of UUID hex
-        
+        session: Database session.
+        uuid_hex: First 24 hex characters of the UUID.
+
     Returns:
-        Optional[FileMetadata]: File if found, None otherwise
-        
-    Last Grunted: 02/04/2026 05:30:00 PM UTC
+        The matching :class:`FileMetadata` or ``None``.
+
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
-    # Query all files and filter - in production, consider adding a 
-    # stored file_id_prefix column for direct index lookup
-    result = await session.execute(select(FileMetadata))
-    for file_meta in result.scalars():
-        if file_meta.id.hex[:24] == uuid_hex:
-            return file_meta
-    return None
+    if len(uuid_hex) != 24:
+        return None
+
+    try:
+        lower = uuid.UUID(uuid_hex + "0" * 8)
+        upper = uuid.UUID(uuid_hex + "f" * 8)
+    except ValueError:
+        return None
+
+    result = await session.execute(
+        select(FileMetadata).where(
+            FileMetadata.id >= lower,
+            FileMetadata.id <= upper,
+        )
+    )
+    return result.scalars().first()
 
 
 def sanitize_filename(filename: str) -> str:

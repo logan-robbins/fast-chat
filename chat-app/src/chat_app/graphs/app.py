@@ -31,10 +31,15 @@ try:
     # Only instrument LangChain to capture chain traces (not individual OpenAI calls)
     LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
-    logger.info(f"[CHAT-APP] Phoenix tracing initialized: {phoenix_endpoint} (project: {project_name})")
+    logger.info(
+        "Phoenix tracing initialized",
+        extra={"endpoint": phoenix_endpoint, "project": project_name}
+    )
 except Exception as e:
-    logger.warning(f"[CHAT-APP] Phoenix instrumentation failed: {e}")
-    logger.info("[CHAT-APP] Continuing without tracing...")
+    logger.warning(
+        "Phoenix instrumentation failed, continuing without tracing",
+        extra={"error": str(e)}
+    )
 
 # Create and compile supervisor with agents
 # Note: LangGraph Server handles persistence automatically, no checkpointer needed

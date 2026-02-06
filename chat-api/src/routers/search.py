@@ -15,7 +15,7 @@ Architecture:
 
 Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
-import logging
+import structlog
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from src.services.errors import internal_error
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -145,11 +145,9 @@ async def search_documents(request: SearchRequest):
     """
     logger.info(
         "search.request",
-        extra={
-            "query_preview": request.query[:50],
-            "collections": request.collections,
-            "limit": request.limit
-        }
+        query_preview=request.query[:50],
+        collections=request.collections,
+        limit=request.limit,
     )
     
     try:
@@ -164,7 +162,8 @@ async def search_documents(request: SearchRequest):
     except Exception as e:
         logger.error(
             "search.embedding_failed",
-            extra={"error": str(e), "query_preview": request.query[:50]}
+            error=str(e),
+            query_preview=request.query[:50],
         )
         return internal_error(f"Failed to generate query embedding: {e}")
     
@@ -195,11 +194,9 @@ async def search_documents(request: SearchRequest):
         except Exception as e:
             logger.warning(
                 "search.collection_failed",
-                extra={
-                    "collection": collection_name,
-                    "error": str(e),
-                    "error_type": type(e).__name__
-                }
+                collection=collection_name,
+                error=str(e),
+                error_type=type(e).__name__,
             )
             # Continue searching other collections
             continue
@@ -210,10 +207,8 @@ async def search_documents(request: SearchRequest):
     
     logger.info(
         "search.completed",
-        extra={
-            "results_count": len(all_results),
-            "top_score": all_results[0].score if all_results else 0
-        }
+        results_count=len(all_results),
+        top_score=all_results[0].score if all_results else 0,
     )
     
     return SearchResponse(

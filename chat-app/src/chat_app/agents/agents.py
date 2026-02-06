@@ -68,7 +68,10 @@ def load_prompt(filename: str) -> str:
     prompt_path = Path(__file__).parent.parent.parent.parent / "prompts" / filename
     
     if not prompt_path.exists():
-        logger.error(f"Prompt file not found: {prompt_path}")
+        logger.error(
+            "Prompt file not found",
+            extra={"path": str(prompt_path)}
+        )
         raise FileNotFoundError(f"Agent prompt not found: {prompt_path}")
     
     with open(prompt_path, 'r', encoding='utf-8') as f:
@@ -300,6 +303,9 @@ def get_all_agents() -> Dict[str, Dict[str, Any]]:
         }
     }
     
-    logger.info(f"Initialized {len(agents)} agents: {list(agents.keys())}")
+    logger.info(
+        "Initialized all agents",
+        extra={"agent_count": len(agents), "agents": list(agents.keys())}
+    )
     
     return agents

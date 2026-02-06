@@ -45,7 +45,7 @@ Reference: https://platform.openai.com/docs/api-reference/chat
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
 import json
-import logging
+import structlog
 import time
 import uuid as uuid_module
 from datetime import datetime, timezone
@@ -53,6 +53,7 @@ from enum import Enum
 from typing import List, Optional, Union, Dict, Any, Literal
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -64,7 +65,8 @@ from src.db.engine import get_session
 from src.db.models import Thread, Message
 from src.services.title_generator import generate_title_with_fallback
 from src.services.http_client import get_client, CHAT_APP_URL
-from src.services.tokens import count_tokens, count_chat_message_tokens, get_context_limit
+from src.services.model_registry import is_model_supported, get_context_limit
+from src.services.tokens import count_tokens, count_chat_message_tokens
 from src.services.errors import (
     create_error_response,
     model_not_found_error,
@@ -75,7 +77,7 @@ from src.services.errors import (
     internal_error,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -392,16 +394,8 @@ class ChatCompletionChunk(BaseModel):
 # Valid Models Configuration
 # ============================================================================
 
-VALID_MODELS: set[str] = {
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo",
-    "o1",
-    "o1-mini",
-    "o3",
-    "o3-mini",
-}
+# Model validation is handled by the shared model registry
+# (src.services.model_registry.is_model_supported)
 
 
 # ============================================================================
@@ -508,10 +502,8 @@ async def create_chat_completion(
         
     Last Grunted: 02/04/2026 08:00:00 PM UTC
     """
-    # Validate model
-    if request.model not in VALID_MODELS and not any(
-        request.model.startswith(m) for m in VALID_MODELS
-    ):
+    # Validate model via shared registry (supports dated variants)
+    if not is_model_supported(request.model):
         return model_not_found_error(request.model)
     
     # Validate messages
@@ -1041,8 +1033,6 @@ async def _handle_non_streaming_response(
         
     Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
-    import httpx
-    
     backend_payload["stream"] = False
     
     # Use shared HTTP client for connection pooling
@@ -1450,13 +1440,34 @@ async def fork_thread(
     session.add(new_thread)
     await session.flush()  # Get ID without committing
     
-    # Copy messages up to checkpoint (for now, copy all messages)
-    # TODO: When checkpoint_id is provided, query checkpointer for state
-    result = await session.execute(
+    # Build query for messages to copy
+    query = (
         sa_select(Message)
         .where(Message.thread_id == thread_id)
         .order_by(Message.created_at)
     )
+
+    # If checkpoint_id is provided, treat it as a message ID and copy
+    # only messages up to (and including) that message's timestamp.
+    if request.checkpoint_id:
+        try:
+            checkpoint_uuid = UUID(request.checkpoint_id)
+            checkpoint_msg = await session.get(Message, checkpoint_uuid)
+            if checkpoint_msg and checkpoint_msg.thread_id == thread_id:
+                query = query.where(Message.created_at <= checkpoint_msg.created_at)
+            else:
+                logger.warning(
+                    "fork.checkpoint_not_found",
+                    checkpoint_id=request.checkpoint_id,
+                    thread_id=str(thread_id),
+                )
+        except ValueError:
+            logger.warning(
+                "fork.invalid_checkpoint_id",
+                checkpoint_id=request.checkpoint_id,
+            )
+
+    result = await session.execute(query)
     messages = result.scalars().all()
     
     for msg in messages:

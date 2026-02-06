@@ -7,7 +7,7 @@ pages to images and sending them to GPT-4o for OCR and interpretation.
 This module is optimized for cloud deployment with parallel processing.
 For large documents, pages are processed concurrently for faster throughput.
 
-API Pattern (verified 02/03/2026):
+API Pattern (verified 02/05/2026):
 - Uses AsyncOpenAI client with chat.completions.create()
 - Images passed as base64 data URIs: "data:image/png;base64,{data}"
 - response_format={"type": "json_object"} for structured output
@@ -18,10 +18,10 @@ Configuration (environment variables - all optional with sensible defaults):
 - VISION_MODEL: Model to use (default: "gpt-4o-mini")
 - VISION_MAX_PAGES: Max pages to process (default: 20)
 
-SDK Version (verified 02/03/2026):
+SDK Version (verified 02/05/2026):
 - openai>=1.10.0: AsyncOpenAI client with vision support
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
 from __future__ import annotations
 
@@ -29,8 +29,6 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -60,7 +58,7 @@ Example visual marker: [VISUAL: Bar Chart - Q1-Q4 revenue showing 52% YoY growth
 If the page has no text, describe any visuals in the text field."""
 
 # Cached client
-_client: Optional[AsyncOpenAI] = None
+_client: AsyncOpenAI | None = None
 
 
 def _get_client() -> AsyncOpenAI:
@@ -79,34 +77,34 @@ async def extract_document_with_vision(
     file_extension: str,
     filename: str,
     visual_analysis: bool = True,
-) -> Tuple[str, str, Optional[str]]:
+) -> tuple[str, str, str | None]:
     """
     Extract text from document using GPT-4o vision.
-    
+
     Converts document pages to images and processes them in parallel
     through the vision API for text extraction and visual analysis.
     Pages are processed using asyncio.gather() for concurrent API calls.
-    
+
     Args:
         file_bytes (bytes): Raw document bytes (PDF or PPTX)
         file_extension (str): File extension including dot (e.g., ".pdf", ".pptx")
         filename (str): Original filename for context in prompts
         visual_analysis (bool): If True, include [VISUAL: ...] markers for
             charts, tables, diagrams, and images inline in extracted text.
-    
+
     Returns:
-        Tuple[str, str, Optional[str]]: (extracted_text, visual_info, error)
+        tuple[str, str, str | None]: (extracted_text, visual_info, error)
             - extracted_text: Combined text from all pages with [Page N] headers
             - visual_info: Empty string (visuals now inline in text)
             - error: Error message if failed, else None
-    
+
     API Details:
         - Uses chat.completions.create() with vision model
         - Images passed as base64 data URIs in content array
         - response_format={"type": "json_object"} ensures valid JSON
         - max_tokens=2000 per page request
-    
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+
+    Last Grunted: 02/05/2026
     """
     # Select converter based on file type
     ext = file_extension.lower()
@@ -119,7 +117,7 @@ async def extract_document_with_vision(
     
     # Convert document to images (CPU-bound, run in executor)
     loop = asyncio.get_running_loop()
-    images: List[DocumentImage] = await loop.run_in_executor(
+    images: list[DocumentImage] = await loop.run_in_executor(
         None,
         lambda: converter(file_bytes, max_pages=VISION_MAX_PAGES)
     )
@@ -190,7 +188,7 @@ async def _extract_page(
             ]
         }]
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     client = _get_client()
     prompt = EXTRACTION_PROMPT.format(filename=filename, page=image.index)

@@ -17,17 +17,23 @@ Configuration:
 - CHROMA_PERSIST_DIR: Directory for persistence (default: in-memory only)
 - CHROMA_COLLECTION: Default collection name (default: "documents")
 
-SDK Version (verified 02/03/2026):
+Threading:
+    ChromaDB's Python client is fully synchronous. All collection operations
+    are wrapped in asyncio.to_thread() so they run in the default thread pool
+    executor and do not block the asyncio event loop. This is important for
+    large batch inserts or queries that may take significant time.
+
+SDK Version (verified 02/05/2026):
 - chromadb>=0.4.22: PersistentClient, Client, get_or_create_collection
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
+import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import chromadb
-from chromadb.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +42,10 @@ PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "")  # Empty = in-memory
 DEFAULT_COLLECTION = os.getenv("CHROMA_COLLECTION", "documents")
 
 # Module-level client (singleton)
-_client: Optional[chromadb.Client] = None
+_client: chromadb.ClientAPI | None = None
 
 
-def _get_client() -> chromadb.Client:
+def _get_client() -> chromadb.ClientAPI:
     """Get or create ChromaDB client."""
     global _client
     if _client is None:
@@ -55,57 +61,57 @@ def _get_client() -> chromadb.Client:
 class ChromaVectorStore:
     """
     Simple vector store using ChromaDB.
-    
+
     ChromaDB handles embedding storage and similarity search with minimal setup.
     Runs in-memory by default (like SQLite :memory:) or persists to disk.
-    
+
     Uses HNSW index with cosine distance metric. Embedding dimensionality is
     set by the first embedding added and cannot be changed afterward.
-    
+
+    All ChromaDB operations are offloaded to threads via asyncio.to_thread()
+    to avoid blocking the event loop, since ChromaDB's Python client is
+    synchronous.
+
     Args:
-        collection_name (str): Name of the collection (default: "documents").
+        collection_name: Name of the collection (default: "documents").
             Collections are isolated namespaces within the ChromaDB instance.
-    
-    Attributes:
-        collection_name (str): Name of the ChromaDB collection
-        _collection: Internal ChromaDB collection reference (set after initialize())
-    
+
     Example:
         store = ChromaVectorStore("my_docs")
         await store.initialize()
         await store.add_document(doc_id="doc1", embedding=[0.1]*1536, ...)
         results = await store.search_similar(query_embedding, limit=5)
-    
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+
+    Last Grunted: 02/05/2026
     """
-    
+
     def __init__(self, collection_name: str = DEFAULT_COLLECTION):
         self.collection_name = collection_name
         self._collection = None
-    
+
     async def initialize(self) -> None:
         """Initialize or get the collection."""
         client = _get_client()
-        self._collection = client.get_or_create_collection(
+        self._collection = await asyncio.to_thread(
+            client.get_or_create_collection,
             name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}  # Use cosine similarity
+            metadata={"hnsw:space": "cosine"},
         )
-        count = self._collection.count()
+        count = await asyncio.to_thread(self._collection.count)
         logger.info(f"ChromaDB: Collection '{self.collection_name}' ready ({count} docs)")
-    
+
     async def add_document(
         self,
         doc_id: str,
-        embedding: List[float],
+        embedding: list[float],
         text: str,
-        metadata: Dict[str, Any],
+        metadata: dict[str, Any],
     ) -> bool:
         """Add a single document."""
         try:
-            # ChromaDB stores metadata as flat dict with string values
             clean_metadata = self._clean_metadata(metadata)
-            
-            self._collection.add(
+            await asyncio.to_thread(
+                self._collection.add,
                 ids=[doc_id],
                 embeddings=[embedding],
                 documents=[text],
@@ -115,19 +121,20 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB add failed: {e}")
             return False
-    
-    async def add_documents_batch(self, documents: List[Dict[str, Any]]) -> int:
+
+    async def add_documents_batch(self, documents: list[dict[str, Any]]) -> int:
         """Batch add multiple documents."""
         if not documents:
             return 0
-        
+
         try:
             ids = [d["doc_id"] for d in documents]
             embeddings = [d["embedding"] for d in documents]
             texts = [d["text"] for d in documents]
             metadatas = [self._clean_metadata(d["metadata"]) for d in documents]
-            
-            self._collection.add(
+
+            await asyncio.to_thread(
+                self._collection.add,
                 ids=ids,
                 embeddings=embeddings,
                 documents=texts,
@@ -138,19 +145,19 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB batch add failed: {e}")
             return 0
-    
+
     async def update_document(
         self,
         doc_id: str,
-        embedding: List[float],
+        embedding: list[float],
         text: str,
-        metadata: Dict[str, Any],
+        metadata: dict[str, Any],
     ) -> bool:
         """Update an existing document."""
         try:
             clean_metadata = self._clean_metadata(metadata)
-            
-            self._collection.update(
+            await asyncio.to_thread(
+                self._collection.update,
                 ids=[doc_id],
                 embeddings=[embedding],
                 documents=[text],
@@ -160,15 +167,16 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB update failed: {e}")
             return False
-    
-    async def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+
+    async def get_document(self, doc_id: str) -> dict[str, Any] | None:
         """Get a document by ID."""
         try:
-            result = self._collection.get(
+            result = await asyncio.to_thread(
+                self._collection.get,
                 ids=[doc_id],
                 include=["documents", "metadatas"],
             )
-            
+
             if result["ids"]:
                 return {
                     "id": result["ids"][0],
@@ -179,45 +187,42 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB get failed: {e}")
             return None
-    
+
     async def search_similar(
         self,
-        query_embedding: List[float],
+        query_embedding: list[float],
         limit: int = 5,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Search for similar documents using cosine similarity.
-        
+
         ChromaDB returns cosine distance (1 - cosine_similarity), so we convert
         back to similarity score. Results are ordered by increasing distance
         (most similar first).
-        
+
         Args:
-            query_embedding (List[float]): Query vector. Must match the
-                dimensionality of stored embeddings (e.g., 1536 for text-embedding-3-small).
-            limit (int): Maximum results to return (default: 5)
-        
+            query_embedding: Query vector. Must match the dimensionality of
+                stored embeddings (e.g., 1536 for text-embedding-3-small).
+            limit: Maximum results to return (default: 5)
+
         Returns:
-            List[Dict[str, Any]]: List of matching documents, each containing:
+            List of matching documents, each containing:
                 - id: Document identifier
                 - text: Document text content
                 - metadata: Document metadata dict
                 - distance: Cosine distance (0 = identical, 2 = opposite)
                 - similarity_score: 1 - distance (1 = identical, -1 = opposite)
-        
-        Formula:
-            cosine_distance = 1 - cosine_similarity
-            similarity_score = 1 - cosine_distance = cosine_similarity
-        
-        Last Grunted: 02/03/2026 02:45:00 PM PST
+
+        Last Grunted: 02/05/2026
         """
         try:
-            results = self._collection.query(
+            results = await asyncio.to_thread(
+                self._collection.query,
                 query_embeddings=[query_embedding],
                 n_results=limit,
                 include=["documents", "metadatas", "distances"],
             )
-            
+
             docs = []
             if results["ids"] and results["ids"][0]:
                 for i, doc_id in enumerate(results["ids"][0]):
@@ -227,36 +232,39 @@ class ChromaVectorStore:
                         "text": results["documents"][0][i] if results["documents"] else "",
                         "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
                         "distance": distance,
-                        "similarity_score": 1 - distance,  # Cosine: distance is 1 - similarity
+                        "similarity_score": 1 - distance,
                     })
             return docs
         except Exception as e:
             logger.error(f"ChromaDB search failed: {e}")
             return []
-    
+
     async def delete_document(self, doc_id: str) -> bool:
         """Delete a single document."""
         try:
-            self._collection.delete(ids=[doc_id])
+            await asyncio.to_thread(self._collection.delete, ids=[doc_id])
             return True
         except Exception as e:
             logger.error(f"ChromaDB delete failed: {e}")
             return False
-    
-    async def delete_documents(self, doc_ids: List[str]) -> bool:
+
+    async def delete_documents(self, doc_ids: list[str]) -> bool:
         """Delete multiple documents."""
         try:
-            self._collection.delete(ids=doc_ids)
+            await asyncio.to_thread(self._collection.delete, ids=doc_ids)
             return True
         except Exception as e:
             logger.error(f"ChromaDB delete failed: {e}")
             return False
-    
-    async def get_all_documents(self) -> List[Dict[str, Any]]:
+
+    async def get_all_documents(self) -> list[dict[str, Any]]:
         """Get all documents."""
         try:
-            result = self._collection.get(include=["documents", "metadatas"])
-            
+            result = await asyncio.to_thread(
+                self._collection.get,
+                include=["documents", "metadatas"],
+            )
+
             docs = []
             for i, doc_id in enumerate(result["ids"]):
                 docs.append({
@@ -268,22 +276,22 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB get_all failed: {e}")
             return []
-    
+
     async def count(self) -> int:
         """Get document count."""
         try:
-            return self._collection.count()
+            return await asyncio.to_thread(self._collection.count)
         except Exception as e:
             logger.error(f"ChromaDB count failed: {e}")
             return 0
-    
+
     async def clear_all(self) -> bool:
-        """Clear all documents."""
+        """Clear all documents by dropping and recreating collection."""
         try:
-            # Delete and recreate collection
             client = _get_client()
-            client.delete_collection(self.collection_name)
-            self._collection = client.get_or_create_collection(
+            await asyncio.to_thread(client.delete_collection, self.collection_name)
+            self._collection = await asyncio.to_thread(
+                client.get_or_create_collection,
                 name=self.collection_name,
                 metadata={"hnsw:space": "cosine"},
             )
@@ -292,25 +300,26 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"ChromaDB clear failed: {e}")
             return False
-    
+
     async def drop_collection(self) -> bool:
         """Permanently drop the collection."""
         try:
             client = _get_client()
-            client.delete_collection(self.collection_name)
+            await asyncio.to_thread(client.delete_collection, self.collection_name)
             self._collection = None
             logger.info(f"ChromaDB: Dropped collection '{self.collection_name}'")
             return True
         except Exception as e:
             logger.error(f"ChromaDB drop failed: {e}")
             return False
-    
-    def _clean_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+
+    def _clean_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         """
         Clean metadata for ChromaDB storage.
-        
+
         ChromaDB only supports str, int, float, bool in metadata.
-        Convert other types to strings.
+        None values are converted to empty strings; other unsupported
+        types are stringified.
         """
         clean = {}
         for key, value in metadata.items():
@@ -326,28 +335,28 @@ class ChromaVectorStore:
 def get_vector_store(collection_name: str = DEFAULT_COLLECTION) -> ChromaVectorStore:
     """
     Factory function to create a ChromaVectorStore.
-    
+
     Creates a new ChromaVectorStore instance. Must call initialize() before use.
     The underlying ChromaDB client is a module-level singleton.
-    
+
     Args:
-        collection_name (str): Name of the collection (default: from CHROMA_COLLECTION
+        collection_name: Name of the collection (default: from CHROMA_COLLECTION
             env var or "documents")
-    
+
     Returns:
-        ChromaVectorStore: Uninitialized store instance. Call await store.initialize()
-            before performing any operations.
-    
+        Uninitialized ChromaVectorStore. Call ``await store.initialize()``
+        before performing any operations.
+
     Example:
         store = get_vector_store("my_docs")
-        await store.initialize()  # Required before use
+        await store.initialize()
         await store.add_document(
             doc_id="doc1",
-            embedding=[0.1] * 1536,  # Must match embedding model dimensions
+            embedding=[0.1] * 1536,
             text="Document content",
             metadata={"filename": "report.pdf"}
         )
-    
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+
+    Last Grunted: 02/05/2026
     """
     return ChromaVectorStore(collection_name=collection_name)

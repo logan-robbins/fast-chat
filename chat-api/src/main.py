@@ -45,11 +45,12 @@ from typing import Callable
 
 import structlog
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from src.db.engine import init_db, close_db
+from src.db.engine import init_db, close_db, check_db_health
 from src.services.http_client import close_client
 from src.routers import chat, files, models, responses, search
 
@@ -179,6 +180,28 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+)
+
+
+# ============================================================================
+# CORS Middleware
+# ============================================================================
+
+# Allowed origins -- defaults to the Chainlit UI on port 8080.
+# Override via CORS_ORIGINS env var (comma-separated) for production.
+_cors_origins: list[str] = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:8080").split(",")
+    if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Response-Time"],
 )
 
 
@@ -419,22 +442,33 @@ async def health_check():
 async def readiness_check():
     """
     Readiness check endpoint for Kubernetes.
-    
+
     Indicates whether the service is ready to accept traffic.
-    Checks database connectivity.
-    
+    Performs a real database connectivity check (``SELECT 1``).
+
     Returns:
-        dict: Readiness status with component health
-        
-    Last Grunted: 02/04/2026 05:30:00 PM UTC
+        dict: Readiness status with component health.
+        JSONResponse 503 if the database is unreachable.
+
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
-    # TODO: Add actual database connectivity check
+    db_ok = await check_db_health()
+
+    if not db_ok:
+        logger.warning("readiness_check.database_unhealthy")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "checks": {"database": "unreachable"},
+            },
+        )
+
     return {
         "status": "ready",
         "checks": {
             "database": "ok",
-            "backend": "ok",
-        }
+        },
     }
 
 

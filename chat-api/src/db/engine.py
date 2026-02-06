@@ -28,7 +28,7 @@ Configuration Environment Variables:
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
 import os
-import logging
+import structlog
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # ============================================================================
 # Configuration
@@ -185,6 +185,29 @@ async def close_db() -> None:
     logger.info("Closing database connections...")
     await engine.dispose()
     logger.info("Database connections closed")
+
+
+async def check_db_health() -> bool:
+    """
+    Check database connectivity by executing a lightweight query.
+
+    Used by the ``/health/ready`` endpoint to confirm the database is
+    reachable before accepting traffic.
+
+    Returns:
+        ``True`` if the database is reachable, ``False`` otherwise.
+
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
+    """
+    from sqlalchemy import text
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        return True
+    except Exception as exc:
+        logger.error("db.health_check_failed", error=str(exc))
+        return False
 
 
 @asynccontextmanager

@@ -3,7 +3,7 @@ File utility functions for ingestion service.
 
 Provides hash calculation and content type detection for document files.
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
 import hashlib
 import os
@@ -35,11 +35,11 @@ def calculate_file_hash(file_content: bytes, filename: str, model: str = "gpt-4o
         The concatenation order matters - changing order produces different hash.
     
     Note:
-        For content-only deduplication (ignoring model), use:
-        hashlib.sha256(file_content).hexdigest()[:16]
-        as done in store_document_with_chunks().
-    
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+        This hash is used as the document ID across all document storage
+        functions (check_document_exists, store_document, store_document_with_chunks).
+        The same file processed with a different model gets a different hash.
+
+    Last Grunted: 02/05/2026
     """
     hasher = hashlib.sha256()
     hasher.update(file_content)
@@ -70,7 +70,7 @@ def get_content_type(filename: str) -> str:
         - .xlsx: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
         - .csv: text/csv
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     ext = os.path.splitext(filename)[1].lower()
     content_types = {

@@ -16,50 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Any
 from sqlmodel import Field, SQLModel, Relationship, Column
-from sqlalchemy import JSON, Integer, String, Boolean, DateTime, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-
-class ThreadMetadataMixin:
-    """Mixin for thread metadata fields.
-    
-    Provides computed metadata properties that are calculated
-    on-demand rather than stored in the database.
-    """
-    
-    async def get_message_count(self, session: AsyncSession) -> int:
-        """Get the number of messages in this thread."""
-        result = await session.execute(
-            select(func.count(Message.id)).where(Message.thread_id == self.id)
-        )
-        return result.scalar() or 0
-    
-    async def get_last_message_preview(self, session: AsyncSession, max_length: int = 100) -> Optional[str]:
-        """Get a preview of the last message in this thread."""
-        result = await session.execute(
-            select(Message)
-            .where(Message.thread_id == self.id)
-            .order_by(Message.created_at.desc())
-            .limit(1)
-        )
-        message = result.scalar_one_or_none()
-        if message and message.content:
-            preview = message.content[:max_length]
-            if len(message.content) > max_length:
-                preview += "..."
-            return preview
-        return None
-    
-    async def get_total_tokens(self, session: AsyncSession) -> int:
-        """Get total token count for this thread."""
-        from sqlalchemy import func
-        # Estimate ~4 characters per token
-        result = await session.execute(
-            select(func.sum(func.length(Message.content) / 4))
-            .where(Message.thread_id == self.id)
-        )
-        total = result.scalar()
-        return int(total) if total else 0
+from sqlalchemy import JSON
 
 
 class Thread(SQLModel, table=True):

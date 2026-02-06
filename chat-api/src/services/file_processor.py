@@ -15,7 +15,7 @@ Dependencies:
 
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
-import logging
+import structlog
 import os
 import uuid
 from dataclasses import dataclass
@@ -25,7 +25,7 @@ import aiofiles
 
 from src.db.models import FileMetadata
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default model for document processing
 DEFAULT_PROCESSING_MODEL: str = "gpt-4o-mini"

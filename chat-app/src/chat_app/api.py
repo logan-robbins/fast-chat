@@ -389,6 +389,130 @@ async def _stream_response(
         yield f"data: {error_chunk.model_dump_json()}\n\n"
 
 
+async def _non_streaming_response(
+    request: ChatCompletionRequest,
+    run_id: str
+) -> JSONResponse:
+    """Execute the graph and return a complete OpenAI-compatible ChatCompletion.
+    
+    Uses graph.ainvoke() to run the full graph execution and collect the
+    final response, then formats it as an OpenAI ChatCompletion object.
+    
+    Args:
+        request: The incoming chat completion request.
+        run_id: Unique identifier for this run.
+        
+    Returns:
+        JSONResponse: OpenAI-compatible ChatCompletion JSON object with:
+            - id: Run identifier
+            - object: "chat.completion"
+            - created: Unix timestamp
+            - model: Model name
+            - choices: List with single choice containing the assistant message
+            - usage: Token usage statistics (if available)
+            
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
+    """
+    thread_id = request.thread_id or str(uuid.uuid4())
+    
+    inputs: Dict[str, Any] = {
+        "messages": _convert_messages(request.messages),
+    }
+    
+    config: Dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": request.user_id,
+        }
+    }
+    
+    logger.info(
+        "Starting non-streaming run",
+        extra={
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "message_count": len(request.messages),
+            "user_id": request.user_id,
+        }
+    )
+    
+    try:
+        result = await graph.ainvoke(inputs, config)
+        
+        # Extract the final assistant message from the result
+        assistant_content = ""
+        messages = result.get("messages", [])
+        if messages:
+            # Walk backwards to find the last AI message
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    assistant_content = msg.content
+                    break
+        
+        # Count tokens for usage reporting
+        prompt_tokens = 0
+        completion_tokens = 0
+        try:
+            from chat_app.summarization import count_tokens, MESSAGE_TOKEN_OVERHEAD
+            for msg in request.messages:
+                prompt_tokens += MESSAGE_TOKEN_OVERHEAD
+                if msg.content:
+                    prompt_tokens += count_tokens(msg.content)
+            completion_tokens = count_tokens(assistant_content)
+        except Exception:
+            pass  # Token counting failure is non-fatal
+        
+        # Build OpenAI-compatible ChatCompletion response
+        response_body: Dict[str, Any] = {
+            "id": run_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        
+        logger.info(
+            "Non-streaming run completed",
+            extra={
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "response_length": len(assistant_content),
+            }
+        )
+        
+        return JSONResponse(content=response_body)
+    
+    except Exception as e:
+        logger.error(
+            "Error in non-streaming run",
+            extra={
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Graph execution failed: {type(e).__name__}: {e}",
+        )
+
+
 async def _stream_resume_response(
     resume_request: ResumeRequest,
     run_id: str
@@ -503,26 +627,21 @@ async def _stream_resume_response(
 
 
 @app_api.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest) -> StreamingResponse:
+async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint.
     
-    Accepts chat completion requests in OpenAI format and returns streaming
-    responses via Server-Sent Events. Supports human-in-the-loop workflows.
+    Accepts chat completion requests in OpenAI format and returns either:
+    - Streaming: SSE stream with token, agent_start, status, and progress events
+    - Non-streaming: Complete OpenAI-compatible ChatCompletion JSON response
     
     Args:
         request: OpenAI-format request containing messages, model, thread_id, etc.
         
     Returns:
-        StreamingResponse: SSE stream containing:
-            - token events: LLM output with agent metadata
-            - agent_start events: Agent routing notifications
-            - progress events: Tool progress updates
-            - OpenAI-compatible completion chunks
+        StreamingResponse: SSE stream (when stream=True)
+        JSONResponse: OpenAI-compatible ChatCompletion object (when stream=False)
             
-    Raises:
-        HTTPException 501: If stream=False (non-streaming not implemented).
-        
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
     run_id = f"run_{uuid.uuid4()}"
     
@@ -537,11 +656,7 @@ async def chat_completions(request: ChatCompletionRequest) -> StreamingResponse:
             }
         )
     else:
-        # Non-streaming implementation
-        raise HTTPException(
-            status_code=501, 
-            detail="Non-streaming not implemented yet. Set stream=True in your request."
-        )
+        return await _non_streaming_response(request, run_id)
 
 
 @app_api.post("/v1/chat/resume")
@@ -576,10 +691,48 @@ async def resume_conversation(resume_request: ResumeRequest) -> StreamingRespons
             }
         )
     else:
-        raise HTTPException(
-            status_code=501, 
-            detail="Non-streaming not implemented yet. Set stream=True in your request."
-        )
+        # Non-streaming resume: invoke graph with Command and return result
+        try:
+            config: Dict[str, Any] = {
+                "configurable": {"thread_id": resume_request.thread_id}
+            }
+            resume_command = Command(resume=resume_request.resume_data)
+            result = await graph.ainvoke(resume_command, config)
+            
+            # Extract final assistant message
+            assistant_content = ""
+            messages = result.get("messages", [])
+            if messages:
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        assistant_content = msg.content
+                        break
+            
+            return JSONResponse(content={
+                "id": run_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": assistant_content},
+                    "finish_reason": "stop",
+                }],
+            })
+        except Exception as e:
+            logger.error(
+                "Error in non-streaming resume",
+                extra={
+                    "run_id": run_id,
+                    "thread_id": resume_request.thread_id,
+                    "error": str(e),
+                },
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Resume failed: {type(e).__name__}: {e}",
+            )
 
 
 @app_api.get("/v1/chat/interrupt/{thread_id}", response_model=InterruptStatus)
@@ -602,7 +755,7 @@ async def get_interrupt_status(thread_id: str) -> InterruptStatus:
     """
     try:
         config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-        state = graph.get_state(config)
+        state = await graph.aget_state(config)
         
         # Check for interrupts in state
         interrupts = state.tasks[0].interrupts if state.tasks else []

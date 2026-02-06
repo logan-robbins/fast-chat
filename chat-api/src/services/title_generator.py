@@ -8,14 +8,14 @@ Uses the shared HTTP client for efficient connection pooling.
 
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
-import logging
+import structlog
 from typing import Optional
 
 import httpx
 
 from src.services.http_client import get_client, CHAT_APP_URL
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Title generation prompt template
 TITLE_PROMPT_TEMPLATE = """Generate a short, descriptive title (max 5 words) for a conversation that starts with this message:

@@ -138,7 +138,7 @@ async def store_user_memory(
         >>> print(memory_id)
         "550e8400-e29b-41d4-a716-446655440000"
         
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026
     """
     store = get_memory_store()
     
@@ -162,9 +162,9 @@ async def store_user_memory(
         )
         return memory_id
     
-    # PostgresStore
+    # PostgresStore -- use async method to avoid blocking the event loop
     try:
-        store.put(namespace, memory_id, data)
+        await store.aput(namespace, memory_id, data)
         logger.debug(
             "Stored memory",
             extra={"user_id": user_id, "memory_id": memory_id, "type": memory_type}
@@ -216,7 +216,7 @@ async def search_user_memories(
         >>> for mem in memories:
         ...     print(f"{mem['type']}: {mem['text']} (score: {mem.get('score')})")
         
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026
     """
     store = get_memory_store()
     namespace = ("memories", user_id)
@@ -243,9 +243,9 @@ async def search_user_memories(
                 })
         return results[:limit]
     
-    # PostgresStore with semantic search
+    # PostgresStore with semantic search -- use async method
     try:
-        results = store.search(namespace, query=query, limit=limit)
+        results = await store.asearch(namespace, query=query, limit=limit)
         
         filtered_results: List[Dict[str, Any]] = []
         for item in results:
@@ -293,6 +293,9 @@ async def get_user_memories(
     Retrieves memories without semantic filtering. Use search_user_memories()
     when you need relevance-based retrieval.
     
+    Uses PostgresStore.asearch() without a semantic query to enumerate
+    namespace contents, avoiding the deprecated broad-query workaround.
+    
     Args:
         user_id: The user's unique identifier (namespace key).
         memory_type: Optional filter by memory type.
@@ -305,12 +308,7 @@ async def get_user_memories(
             - type: Memory type
             - metadata: Additional stored metadata
             
-    Note:
-        For PostgresStore, this uses a broad semantic query as a workaround
-        since list operations aren't directly supported. Consider using
-        search_user_memories() for better results.
-        
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026
     """
     store = get_memory_store()
     namespace = ("memories", user_id)
@@ -332,15 +330,11 @@ async def get_user_memories(
             })
         return results
     
-    # PostgresStore - use search with broad query
+    # PostgresStore -- use asearch() without a query to enumerate items.
+    # BaseStore.search() with query=None returns items without semantic
+    # filtering, which is the correct way to list namespace contents.
     try:
-        # Note: PostgresStore doesn't have a direct list method,
-        # so we use a broad semantic query to retrieve memories
-        results = store.search(
-            namespace, 
-            query="user preferences facts information context",
-            limit=limit
-        )
+        results = await store.asearch(namespace, limit=limit)
         
         filtered_results: List[Dict[str, Any]] = []
         for item in results:
@@ -354,14 +348,15 @@ async def get_user_memories(
                 "metadata": item.value.get("metadata", {})
             })
         return filtered_results
-        
+
     except Exception as e:
         logger.error(
             "Failed to get user memories",
             extra={
                 "user_id": user_id,
                 "memory_type": memory_type,
-                "error": str(e)
+                "error": str(e),
+                "error_type": type(e).__name__,
             }
         )
         return []
@@ -379,7 +374,7 @@ async def delete_user_memory(user_id: str, memory_id: str) -> bool:
     Returns:
         bool: True if memory was deleted successfully, False if not found or error.
         
-    Last Grunted: 02/04/2026 06:30:00 PM PST
+    Last Grunted: 02/05/2026
     """
     store = get_memory_store()
     namespace = ("memories", user_id)
@@ -395,9 +390,9 @@ async def delete_user_memory(user_id: str, memory_id: str) -> bool:
             return True
         return False
     
-    # PostgresStore
+    # PostgresStore -- use async method
     try:
-        store.delete(namespace, memory_id)
+        await store.adelete(namespace, memory_id)
         logger.debug(
             "Deleted memory",
             extra={"user_id": user_id, "memory_id": memory_id}
@@ -409,7 +404,8 @@ async def delete_user_memory(user_id: str, memory_id: str) -> bool:
             extra={
                 "user_id": user_id,
                 "memory_id": memory_id,
-                "error": str(e)
+                "error": str(e),
+                "error_type": type(e).__name__,
             }
         )
         return False

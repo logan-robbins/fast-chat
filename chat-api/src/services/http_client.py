@@ -31,13 +31,13 @@ Configuration Environment Variables:
 Last Grunted: 02/04/2026 05:30:00 PM UTC
 """
 import os
-import logging
+import structlog
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import httpx
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # ============================================================================
 # Configuration
@@ -127,11 +127,9 @@ async def get_client() -> httpx.AsyncClient:
     
     if _client is None:
         logger.info(
-            "Initializing HTTP client",
-            extra={
-                "max_connections": HTTP_MAX_CONNECTIONS,
-                "max_keepalive": HTTP_MAX_KEEPALIVE,
-            }
+            "http_client.init",
+            max_connections=HTTP_MAX_CONNECTIONS,
+            max_keepalive=HTTP_MAX_KEEPALIVE,
         )
         _client = httpx.AsyncClient(
             limits=_create_limits(),

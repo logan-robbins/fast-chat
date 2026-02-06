@@ -15,12 +15,19 @@ Local development fallback (optional):
 - OLLAMA_CHAT_MODEL: Local chat model (default: llama3.2:latest)
 - OLLAMA_EMBED_MODEL: Local embedding model (default: nomic-embed-text, 768 dims)
 
-SDK Versions (verified 02/03/2026):
+WARNING - Embedding Dimension Mismatch:
+    Cloud mode uses text-embedding-3-small which produces 1536-dimensional vectors.
+    Local mode uses nomic-embed-text which produces 768-dimensional vectors.
+    Switching between cloud and local WILL BREAK existing ChromaDB collections
+    because HNSW index dimensionality is locked at first insert. You MUST delete
+    and recreate all collections when changing embedding modes.
+
+SDK Versions (verified 02/05/2026):
 - langchain>=0.1.0
 - langchain_openai>=0.0.5
 - langchain_ollama>=0.0.1 (optional, for local mode)
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
 import os
 import logging
@@ -85,7 +92,7 @@ def get_llm_model(model_name: str = None):
         llm = get_llm_model("gpt-4o")  # Uses GPT-4o
         response = llm.invoke("Summarize this text...")
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     if USE_LOCAL_MODELS:
         ChatOllama, _ = _get_ollama_classes()
@@ -124,11 +131,16 @@ def get_embeddings_model():
     Raises:
         RuntimeError: If USE_LOCAL_MODELS=true but langchain_ollama not installed
     
+    Warning:
+        Cloud (1536 dims) and local (768 dims) produce INCOMPATIBLE vectors.
+        Switching modes requires deleting and recreating all ChromaDB collections.
+        HNSW index dimensionality is fixed at first insert and cannot be changed.
+
     Note:
         For batch embedding, use embed_documents() which is more efficient
         than calling embed_query() in a loop due to API batching.
-    
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+
+    Last Grunted: 02/05/2026
     """
     if USE_LOCAL_MODELS:
         _, OllamaEmbeddings = _get_ollama_classes()

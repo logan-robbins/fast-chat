@@ -15,11 +15,11 @@ System Requirements:
   Install: apt-get install poppler-utils (Debian/Ubuntu)
            brew install poppler (macOS)
 
-SDK Versions (verified 02/03/2026):
+SDK Versions (verified 02/05/2026):
 - pdf2image 1.17.0: convert_from_bytes() with dpi, first_page, last_page params
 - Pillow 10.2.0: Image.Resampling.LANCZOS for high-quality downscaling
 
-Last Grunted: 02/03/2026 02:45:00 PM PST
+Last Grunted: 02/05/2026
 """
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ import base64
 import logging
 from dataclasses import dataclass
 from io import BytesIO
-from typing import List, Optional
 
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -51,7 +50,7 @@ class DocumentImage:
     Example:
         image_url = f"data:image/png;base64,{doc_image.base64_data}"
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     index: int
     base64_data: str
@@ -66,10 +65,10 @@ DEFAULT_MAX_PAGES = 20  # Reasonable limit for most documents
 def pdf_bytes_to_base64_images(
     pdf_bytes: bytes,
     *,
-    max_pages: Optional[int] = DEFAULT_MAX_PAGES,
+    max_pages: int | None = DEFAULT_MAX_PAGES,
     dpi: int = DEFAULT_DPI,
     max_edge: int = DEFAULT_MAX_EDGE,
-) -> List[DocumentImage]:
+) -> list[DocumentImage]:
     """
     Convert PDF document to list of base64-encoded PNG images.
     
@@ -87,7 +86,7 @@ def pdf_bytes_to_base64_images(
             Optimal for GPT-4o vision which handles up to 2048px.
     
     Returns:
-        List[DocumentImage]: List of DocumentImage objects with 1-based indices.
+        list[DocumentImage]: List of DocumentImage objects with 1-based indices.
             Empty list if conversion fails (logged as exception).
     
     Raises:
@@ -97,7 +96,7 @@ def pdf_bytes_to_base64_images(
         Requires poppler-utils system package. Without it, pdf2image raises
         PDFInfoNotInstalledError.
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     try:
         pages = convert_from_bytes(
@@ -126,10 +125,10 @@ def pdf_bytes_to_base64_images(
 def pptx_bytes_to_base64_images(
     pptx_bytes: bytes,
     *,
-    max_pages: Optional[int] = DEFAULT_MAX_PAGES,  # Named max_pages for API consistency
+    max_pages: int | None = DEFAULT_MAX_PAGES,  # Named max_pages for API consistency
     dpi: int = DEFAULT_DPI,
     max_edge: int = DEFAULT_MAX_EDGE,
-) -> List[DocumentImage]:
+) -> list[DocumentImage]:
     """
     Convert PPTX presentation to list of base64-encoded PNG images.
     
@@ -147,7 +146,7 @@ def pptx_bytes_to_base64_images(
         max_edge (int): Maximum image dimension after resizing (default: 1400px)
     
     Returns:
-        List[DocumentImage]: List of DocumentImage objects with 1-based indices.
+        list[DocumentImage]: List of DocumentImage objects with 1-based indices.
             Failed slides get placeholder images with error message.
             Empty list if PPTX parsing fails entirely.
     
@@ -159,11 +158,10 @@ def pptx_bytes_to_base64_images(
         - Text rendering quality depends on available system fonts
         - Tables are rendered with simplified cell borders
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     try:
         from pptx import Presentation
-        from pptx.util import Inches
         
         buffer = BytesIO(pptx_bytes)
         prs = Presentation(buffer)
@@ -217,7 +215,7 @@ def pptx_bytes_to_base64_images(
         return []
 
 
-def _render_slide_to_image(slide, width: int, height: int) -> Optional[Image.Image]:
+def _render_slide_to_image(slide, width: int, height: int) -> Image.Image | None:
     """
     Render a PPTX slide to a PIL Image.
     
@@ -225,13 +223,12 @@ def _render_slide_to_image(slide, width: int, height: int) -> Optional[Image.Ima
     This is a simplified renderer - complex elements may not render perfectly,
     but the vision model can interpret the content.
     """
-    from pptx.enum.shapes import MSO_SHAPE_TYPE
     from PIL import ImageDraw, ImageFont
-    
+
     # Create white background
     img = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(img)
-    
+
     # Try to use a basic font, fall back to default
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
@@ -239,10 +236,7 @@ def _render_slide_to_image(slide, width: int, height: int) -> Optional[Image.Ima
     except (OSError, IOError):
         font = ImageFont.load_default()
         title_font = font
-    
-    # Scale factor from slide EMUs to image pixels
-    slide_width = slide.shapes._spTree.getparent().getparent().get_or_add_cSld().get_or_add_spTree
-    
+
     for shape in slide.shapes:
         try:
             # Get shape position (convert EMUs to pixels)
@@ -357,7 +351,7 @@ def _pil_to_base64(image: Image.Image, *, max_edge: int) -> str:
         PNG format is used with optimize=True for smaller file size.
         Output is always RGB-compatible for vision API consumption.
     
-    Last Grunted: 02/03/2026 02:45:00 PM PST
+    Last Grunted: 02/05/2026
     """
     if max(image.size) > max_edge:
         ratio = max_edge / max(image.size)

@@ -5,17 +5,26 @@ Provides accurate token counting for OpenAI models using the official
 tiktoken library. Falls back to character-based estimation if tiktoken
 is unavailable or for unsupported models.
 
+Context-window limits and encoding names are sourced from the shared
+model registry (``src.services.model_registry``) so there is a single
+source of truth.
+
 Supported encodings:
-    - o200k_base: gpt-4o, gpt-4o-mini, o1, o3 series
+    - o200k_base: gpt-4o, gpt-4o-mini, gpt-4.1, gpt-5, o1, o3 series
     - cl100k_base: gpt-4-turbo, gpt-4, gpt-3.5-turbo
 
-Last Grunted: 02/04/2026 05:30:00 PM UTC
+Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
-import logging
+import structlog
 from functools import lru_cache
 from typing import List, Optional, Any, Union
 
-logger = logging.getLogger(__name__)
+from src.services.model_registry import (
+    get_context_limit as _registry_get_context_limit,
+    get_tiktoken_encoding as _registry_get_tiktoken_encoding,
+)
+
+logger = structlog.get_logger(__name__)
 
 # Try to import tiktoken, fall back to estimation if unavailable
 try:
@@ -37,30 +46,32 @@ except ImportError:
 def _get_encoding(model: str):
     """
     Get the tiktoken encoding for a model (cached).
-    
+
+    First tries tiktoken's built-in model mapping, then falls back to
+    the encoding name registered in the model registry.
+
     Args:
         model: Model name (e.g., "gpt-4o", "gpt-4-turbo")
-        
+
     Returns:
-        tiktoken.Encoding or None if unavailable
-        
-    Last Grunted: 02/04/2026 05:30:00 PM UTC
+        tiktoken.Encoding or None if tiktoken is unavailable.
+
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
     if not TIKTOKEN_AVAILABLE:
         return None
-    
+
     try:
         return tiktoken.encoding_for_model(model)
     except KeyError:
-        # Model not found, try to infer encoding from model name
-        if any(m in model.lower() for m in ["gpt-4o", "o1", "o3"]):
-            return tiktoken.get_encoding("o200k_base")
-        elif any(m in model.lower() for m in ["gpt-4", "gpt-3.5"]):
-            return tiktoken.get_encoding("cl100k_base")
-        else:
-            # Default to latest encoding
-            logger.debug(f"Unknown model '{model}', using o200k_base encoding")
-            return tiktoken.get_encoding("o200k_base")
+        # Model not in tiktoken's built-in map -- use registry fallback
+        encoding_name = _registry_get_tiktoken_encoding(model)
+        logger.debug(
+            "tokens.tiktoken_fallback",
+            model=model,
+            encoding=encoding_name,
+        )
+        return tiktoken.get_encoding(encoding_name)
 
 
 # ============================================================================
@@ -277,59 +288,24 @@ def count_input_tokens(
 
 
 # ============================================================================
-# Model Context Limits
+# Model Context Limits -- delegated to the shared model registry
 # ============================================================================
 
-MODEL_CONTEXT_LIMITS: dict[str, int] = {
-    # GPT-4o series
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-4o-2024-05-13": 128000,
-    "gpt-4o-2024-08-06": 128000,
-    
-    # GPT-4 series
-    "gpt-4-turbo": 128000,
-    "gpt-4-turbo-preview": 128000,
-    "gpt-4-1106-preview": 128000,
-    "gpt-4": 8192,
-    "gpt-4-32k": 32768,
-    
-    # GPT-3.5 series
-    "gpt-3.5-turbo": 16385,
-    "gpt-3.5-turbo-16k": 16385,
-    
-    # O-series (reasoning models)
-    "o1": 200000,
-    "o1-preview": 128000,
-    "o1-mini": 128000,
-    "o3": 200000,
-    "o3-mini": 200000,
-}
-
-
 def get_context_limit(model: str) -> int:
-    """
-    Get the context window limit for a model.
-    
+    """Return the context-window token limit for *model*.
+
+    Delegates to ``src.services.model_registry.get_context_limit``
+    so there is a single source of truth.
+
     Args:
-        model: Model name
-        
+        model: Model name.
+
     Returns:
-        int: Maximum context tokens (defaults to 128000 for unknown models)
-        
-    Last Grunted: 02/04/2026 05:30:00 PM UTC
+        Maximum context tokens (defaults to 128 000 for unknown models).
+
+    Last Grunted: 02/05/2026 12:00:00 PM UTC
     """
-    # Direct match
-    if model in MODEL_CONTEXT_LIMITS:
-        return MODEL_CONTEXT_LIMITS[model]
-    
-    # Try base model name match
-    for known_model, limit in MODEL_CONTEXT_LIMITS.items():
-        if model.startswith(known_model):
-            return limit
-    
-    # Default to common limit
-    return 128000
+    return _registry_get_context_limit(model)
 
 
 def check_context_overflow(
