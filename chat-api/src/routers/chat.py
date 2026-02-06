@@ -778,14 +778,50 @@ async def _handle_streaming_response(
                         # Handle extended events (status, agent_start, progress, etc.)
                         if current_event_type and current_event_type != "message":
                             if data == "[DONE]":
+                                current_event_type = None
                                 continue
                             try:
                                 event_data = json.loads(data)
                                 
+                                # Handle token events: extract content AND emit as
+                                # OpenAI-compatible chunks so standard clients work.
+                                if current_event_type == "token":
+                                    content = event_data.get("content", "")
+                                    if content:
+                                        full_content.append(content)
+                                        completion_tokens += count_tokens(content, model)
+                                        
+                                        content_chunk = ChatCompletionChunk(
+                                            id=completion_id,
+                                            object="chat.completion.chunk",
+                                            created=created_timestamp,
+                                            model=model,
+                                            choices=[ChatCompletionChunkChoice(
+                                                index=0,
+                                                delta=ChatCompletionChunkDelta(content=content),
+                                                finish_reason=None
+                                            )]
+                                        )
+                                        yield f"data: {content_chunk.model_dump_json()}\n\n"
+                                        
+                                        # Emit periodic usage updates
+                                        if _include_usage and (completion_tokens - last_usage_emit) >= USAGE_EMIT_INTERVAL:
+                                            last_usage_emit = completion_tokens
+                                            context_limit = get_context_limit(model)
+                                            total = _prompt_tokens + completion_tokens
+                                            running_usage = {
+                                                "prompt_tokens": _prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                                "total_tokens": total,
+                                                "context_window_limit": context_limit,
+                                                "context_utilization_pct": round((total / context_limit) * 100, 1),
+                                                "is_final": False
+                                            }
+                                            yield f"event: usage\ndata: {json.dumps(running_usage)}\n\n"
+                                
                                 # Handle status events (ChatGPT/Claude-style)
-                                if current_event_type == "status":
+                                elif current_event_type == "status":
                                     if _include_status:
-                                        # Validate and forward status event
                                         status_type = event_data.get("type")
                                         status_message = event_data.get("message")
                                         
@@ -797,14 +833,9 @@ async def _handle_streaming_response(
                                                 message=status_message[:50]
                                             )
                                             yield f"event: status\ndata: {json.dumps(event_data)}\n\n"
-                                        else:
-                                            logger.warning(
-                                                "chat.streaming.invalid_status_event",
-                                                completion_id=completion_id,
-                                                event_data=event_data
-                                            )
+                                
                                 else:
-                                    # Forward other extended events (agent_start, progress, etc.)
+                                    # Forward other extended events (agent_start, progress, complete, etc.)
                                     yield f"event: {current_event_type}\ndata: {json.dumps(event_data)}\n\n"
                                     
                             except json.JSONDecodeError as e:
@@ -864,6 +895,31 @@ async def _handle_streaming_response(
                                     "is_final": True
                                 }
                                 yield f"event: usage\ndata: {json.dumps(extended_usage)}\n\n"
+                            
+                            # Persist assistant response BEFORE [DONE] to avoid
+                            # async generator cleanup issues with Starlette.
+                            if full_content:
+                                try:
+                                    from src.db.engine import get_session_context
+                                    async with get_session_context() as persist_session:
+                                        assistant_msg = Message(
+                                            thread_id=thread_id,
+                                            role="assistant",
+                                            content="".join(full_content)
+                                        )
+                                        persist_session.add(assistant_msg)
+                                    logger.info(
+                                        "chat.streaming.persisted",
+                                        completion_id=completion_id,
+                                        thread_id=str(thread_id),
+                                        completion_tokens=completion_tokens
+                                    )
+                                except Exception as persist_err:
+                                    logger.warning(
+                                        "chat.streaming.persist_failed",
+                                        completion_id=completion_id,
+                                        error=str(persist_err)
+                                    )
                             
                             yield "data: [DONE]\n\n"
                             break
@@ -964,31 +1020,13 @@ async def _handle_streaming_response(
             yield f"data: {json.dumps(error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
         finally:
-            # Persist assistant response using session context manager
-            if full_content:
-                try:
-                    from src.db.engine import get_session_context
-                    async with get_session_context() as persist_session:
-                        assistant_msg = Message(
-                            thread_id=thread_id,
-                            role="assistant",
-                            content="".join(full_content)
-                        )
-                        persist_session.add(assistant_msg)
-                        # Commit happens automatically on context exit
-                    
-                    logger.debug(
-                        "chat.streaming.persisted",
-                        completion_id=completion_id,
-                        thread_id=str(thread_id),
-                        completion_tokens=completion_tokens
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "chat.streaming.persist_failed",
-                        completion_id=completion_id,
-                        error=str(e)
-                    )
+            # Persistence now happens before [DONE] to avoid async generator
+            # cleanup issues. This block is only for connection cleanup logging.
+            logger.debug(
+                "chat.streaming.generator_cleanup",
+                completion_id=completion_id,
+                content_chunks=len(full_content)
+            )
     
     return StreamingResponse(
         stream_generator(),
@@ -1280,7 +1318,7 @@ async def update_thread(
     if request.is_pinned is not None:
         thread.is_pinned = request.is_pinned
     
-    thread.updated_at = datetime.now(timezone.utc)
+    thread.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await session.commit()
     await session.refresh(thread)
     
@@ -1321,34 +1359,81 @@ async def delete_thread(
     thread_id: UUID,
     session: AsyncSession = Depends(get_session)
 ):
-    """Delete a thread and all its messages.
+    """Delete a thread, its messages, associated files, and vector collection.
+    
+    Cascading deletions:
+    1. Messages belonging to the thread
+    2. File metadata records associated with the thread
+    3. Vector collection ``thread_{thread_id}`` (and its ``_summary`` companion)
+    4. The thread record itself
+    
+    Vector collection cleanup is best-effort -- if docproc is unavailable
+    the thread is still deleted from PostgreSQL.
     
     Args:
         thread_id: Thread UUID
         session: Database session
         
     Returns:
-        dict: Deletion confirmation
+        dict: Deletion confirmation with cleanup details
         
     Raises:
         HTTPException: 404 if thread not found
         
-    Last Grunted: 02/04/2026 04:50:00 PM UTC
+    Last Grunted: 02/05/2026 06:00:00 PM UTC
     """
+    from src.db.models import FileMetadata
+
     thread = await session.get(Thread, thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
     
-    # Delete all messages first
+    # Delete all messages
     await session.execute(
         delete(Message).where(Message.thread_id == thread_id)
     )
+    
+    # Delete associated file metadata records
+    await session.execute(
+        delete(FileMetadata).where(FileMetadata.thread_id == thread_id)
+    )
+    
+    # Best-effort: drop the thread's vector collection
+    vector_deleted = False
+    collection_name = f"thread_{thread_id}"
+    try:
+        from docproc import delete_collection as docproc_delete_collection
+        success, count = await docproc_delete_collection(collection_name)
+        vector_deleted = success
+        if success:
+            logger.info(
+                "chat.thread.vector_cleanup",
+                thread_id=str(thread_id),
+                collection=collection_name,
+                documents_removed=count,
+            )
+    except ImportError:
+        logger.debug(
+            "chat.thread.vector_cleanup_skipped",
+            reason="docproc not installed",
+            thread_id=str(thread_id),
+        )
+    except Exception as e:
+        logger.warning(
+            "chat.thread.vector_cleanup_failed",
+            thread_id=str(thread_id),
+            error=str(e),
+        )
     
     # Delete the thread
     await session.delete(thread)
     await session.commit()
     
-    return {"deleted": True, "thread_id": str(thread_id)}
+    return {
+        "deleted": True,
+        "thread_id": str(thread_id),
+        "vector_collection_deleted": vector_deleted,
+    }
 
 
 @router.post("/v1/threads/{thread_id}/messages/{message_id}/edit")
@@ -1390,7 +1475,7 @@ async def edit_message(
     
     # Update the message
     message.content = request.new_content
-    message.created_at = datetime.now(timezone.utc)  # Reset timestamp
+    message.created_at = datetime.now(timezone.utc).replace(tzinfo=None)  # Reset timestamp
     
     # Delete all subsequent messages (truncate conversation)
     await session.execute(

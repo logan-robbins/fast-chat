@@ -381,11 +381,18 @@ RAG_AGENT_DEF = """<agent name="knowledge_base">
 </best_for>
 </agent>"""
 
-RAG_INSTRUCTIONS = """# File and Knowledge Source Handling Instructions
-- When users reference "documents I uploaded" or "based on the documents", route to knowledge_base
-- For questions about uploaded files or document content, always use knowledge_base
-- Always try the knowledge_base agent FIRST for information retrieval
-- If knowledge_base cannot provide a sufficient answer, you may then use websearch"""
+RAG_INSTRUCTIONS = """# IMPORTANT: File and Knowledge Source Handling Instructions
+
+The user has uploaded documents to this conversation. You MUST use the handoff_to_knowledge_base tool 
+to search these documents before answering any question that could be answered by the uploaded files.
+
+Rules:
+- ANY question referencing "documents", "uploaded", "files", "based on", or specific document names 
+  MUST be delegated to the knowledge_base agent using handoff_to_knowledge_base
+- DO NOT try to answer document-related questions from your own knowledge
+- DO NOT say "the documents don't contain..." without FIRST calling handoff_to_knowledge_base to search
+- If the user asks about uploaded content, call handoff_to_knowledge_base with a clear search task description
+- If knowledge_base returns no results, THEN you may say the information wasn't found"""
 
 
 async def pre_model_hook(
@@ -455,16 +462,46 @@ async def pre_model_hook(
     # Extract configurable values
     configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
     file_context_md: Optional[str] = configurable.get("file_context")
+    vector_collections: list = configurable.get("vector_collections", [])
     user_id: Optional[str] = configurable.get("user_id")
     
-    # Build RAG agent definition if files are present
+    # Build RAG agent definition and pre-fetch relevant documents
     rag_agent_def = ""
     rag_instructions = ""
     
-    if file_context_md:
+    if file_context_md or vector_collections:
         rag_agent_def = RAG_AGENT_DEF
         rag_instructions = RAG_INSTRUCTIONS
-        rag_instructions += f"\n\n---\n\n# File Context\n{file_context_md}"
+        if file_context_md:
+            rag_instructions += f"\n\n---\n\n# File Context\n{file_context_md}"
+        
+        # Pre-fetch relevant document chunks for the user's question.
+        # This injects RAG context directly so the supervisor can answer
+        # without needing to delegate -- more reliable than tool routing.
+        if vector_collections and messages:
+            last_user_msg = _extract_last_human_message(messages)
+            if last_user_msg:
+                try:
+                    from chat_app.services.bff_client import search_documents
+                    search_results = await search_documents(
+                        query=last_user_msg,
+                        collections=vector_collections,
+                        limit=8,
+                    )
+                    if search_results:
+                        doc_context = "\n\n# Retrieved Document Context\n"
+                        doc_context += "The following excerpts were retrieved from the user's uploaded documents:\n\n"
+                        for i, result in enumerate(search_results, 1):
+                            doc_context += f"[{i}] (from {result.filename}, relevance: {result.score:.0%})\n"
+                            doc_context += f"{result.text}\n\n"
+                        rag_instructions += doc_context
+                        logger.info(
+                            "pre_model_hook.rag_prefetch",
+                            results=len(search_results),
+                            top_score=search_results[0].score if search_results else 0,
+                        )
+                except Exception as e:
+                    logger.warning("pre_model_hook.rag_prefetch_failed", error=str(e))
     
     # Build intent context if classification is available
     intent_context = ""
@@ -503,9 +540,12 @@ async def pre_model_hook(
         f"\n\n{system_prompt}"
     )
     
+    output_messages = [SystemMessage(content=full_system_content)]
+    output_messages.extend(messages)
+    
     # Return state update (never mutate state directly)
     return {
-        "llm_input_messages": [SystemMessage(content=full_system_content)] + messages,
+        "llm_input_messages": output_messages,
         "conversation_summary": new_summary
     }
 
@@ -646,7 +686,7 @@ def create_supervisor_graph(agents: Dict[str, Dict[str, Any]]):
         model=supervisor_model,
         agents=[agents[name]["agent"] for name in agents],
         tools=handoff_tools,
-        prompt=None,  # System prompt is built dynamically in pre_model_hook
+        prompt=None,  # pre_model_hook provides dynamic system prompt via llm_input_messages
         pre_model_hook=pre_model_hook,
         state_schema=ChatAppState,  # Explicit TypedDict state schema
         add_handoff_messages=False,  # Isolated context - no history to subagents

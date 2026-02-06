@@ -29,15 +29,22 @@ from docproc.services.document_store import (
     store_document_with_chunks,
     check_document_exists,
     delete_document,
+    delete_documents_for_file,
     delete_collection,
     get_all_documents,
     get_document_count,
     clear_all_documents,
     ensure_vector_store_initialized,
 )
-from docproc.utils.vector_store import ChromaVectorStore, get_vector_store
+from docproc.utils.vector_store import (
+    ChromaVectorStore,
+    get_vector_store,
+    collection_exists,
+    list_collections,
+)
 from docproc.utils.llm_config import get_llm_model, get_embeddings_model
 from docproc.utils.file_helpers import calculate_file_hash, get_content_type
+from docproc.config import IngestionConfig, get_ingestion_config
 
 __version__ = "2.1.0"
 
@@ -54,6 +61,7 @@ __all__ = [
     "store_document_with_chunks",
     "check_document_exists",
     "delete_document",
+    "delete_documents_for_file",
     "delete_collection",
     "get_all_documents",
     "get_document_count",
@@ -62,10 +70,15 @@ __all__ = [
     # Vector store
     "ChromaVectorStore",
     "get_vector_store",
+    "collection_exists",
+    "list_collections",
     # LLM
     "get_llm_model",
     "get_embeddings_model",
     # Utilities
     "calculate_file_hash",
     "get_content_type",
+    # Configuration
+    "IngestionConfig",
+    "get_ingestion_config",
 ]

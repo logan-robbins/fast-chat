@@ -4,24 +4,36 @@ Multimodal document extraction using OpenAI GPT-4o vision.
 Extracts text and visual analysis from PDF and PPTX documents by converting
 pages to images and sending them to GPT-4o for OCR and interpretation.
 
-This module is optimized for cloud deployment with parallel processing.
-For large documents, pages are processed concurrently for faster throughput.
+This module is optimized for cloud deployment with semaphore-limited
+concurrent processing. Pages are processed in parallel up to
+VISION_CONCURRENCY (default 5) to balance throughput against API rate limits.
 
-API Pattern (verified 02/05/2026):
+API Pattern (verified 02/06/2026):
 - Uses AsyncOpenAI client with chat.completions.create()
 - Images passed as base64 data URIs: "data:image/png;base64,{data}"
-- response_format={"type": "json_object"} for structured output
-- max_tokens=2000 per page (sufficient for most document pages)
+- response_format=json_schema with strict: true for guaranteed schema
+  compliance (2026 production standard, replaces legacy json_object mode)
+- max_tokens=4096 per page (sufficient for dense document pages with
+  tables and complex layouts)
 
 Configuration (environment variables - all optional with sensible defaults):
 - OPENAI_API_KEY: Required API key
-- VISION_MODEL: Model to use (default: "gpt-4o-mini")
+- VISION_MODEL: Model to use (default: "gpt-4o")
 - VISION_MAX_PAGES: Max pages to process (default: 20)
+- VISION_CONCURRENCY: Max concurrent API calls per document (default: 5)
 
-SDK Version (verified 02/05/2026):
-- openai>=1.10.0: AsyncOpenAI client with vision support
+Model Selection (researched 02/06/2026):
+- gpt-4o is the recommended default for document extraction with visual
+  content. GPT-4o scores 69.1% on MMMU vs 59.4% for gpt-4o-mini.
+- gpt-4o-mini uses up to 20x more tokens for vision tasks, which can
+  offset its lower per-token cost savings.
+- For text-only extraction without visual elements, gpt-4o-mini may be
+  a cost-effective alternative; override via VISION_MODEL env var.
 
-Last Grunted: 02/05/2026
+SDK Version (verified 02/06/2026):
+- openai>=1.10.0: AsyncOpenAI client with vision + structured outputs
+
+Last Grunted: 02/06/2026
 """
 from __future__ import annotations
 
@@ -40,22 +52,62 @@ from docproc.utils.image_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Simple configuration with sensible defaults
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
-VISION_MAX_PAGES = int(os.getenv("VISION_MAX_PAGES", "20"))
+# Configuration -- loaded from centralized IngestionConfig.
+# Module-level constants kept for backward compatibility in code that
+# references VISION_MODEL, VISION_MAX_PAGES, VISION_CONCURRENCY directly.
+from docproc.config import get_ingestion_config as _get_config
 
-# Extraction prompt - requests JSON output with inline visual descriptions
-EXTRACTION_PROMPT = """You are an expert document transcription assistant.
+def _cfg():
+    return _get_config()
+
+# Lazy-evaluated but eagerly-read module constants
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
+VISION_MAX_PAGES = int(os.getenv("VISION_MAX_PAGES", "20"))
+VISION_CONCURRENCY = int(os.getenv("VISION_CONCURRENCY", "5"))
+
+# Extraction prompt - requests structured output with inline visual descriptions.
+# The response_format json_schema enforces the output shape; the prompt guides
+# content quality and visual marker placement.
+EXTRACTION_PROMPT = """You are an expert document transcription and OCR assistant.
 Document: {filename} | Page: {page}
 
-Extract ALL text content from this page image. Also describe any visual elements (charts, tables, diagrams, images) INLINE where they appear.
+Your task:
+1. Extract ALL text content from this page image exactly as it appears.
+2. Preserve the original reading order, paragraph breaks, and heading hierarchy.
+3. For tables, reproduce the structure using Markdown table syntax.
+4. For visual elements (charts, diagrams, images, figures), insert a descriptive
+   [VISUAL: type - description] marker INLINE at the position where the element
+   appears in the document layout.
 
-Respond with JSON:
-{{"text": "full extracted text with [VISUAL: type - description] markers for visual elements"}}
+Visual marker example:
+[VISUAL: Bar Chart - Q1-Q4 revenue showing 52% YoY growth, Q4 peak at $3.2M]
 
-Example visual marker: [VISUAL: Bar Chart - Q1-Q4 revenue showing 52% YoY growth, Q4 peak at $3.2M]
+If the page contains only visual elements with no text, describe them in detail."""
 
-If the page has no text, describe any visuals in the text field."""
+# JSON Schema for structured output (strict mode).
+# Enforced at the token generation level — the model cannot produce
+# non-conforming responses. Replaces legacy {"type": "json_object"}.
+EXTRACTION_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "page_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Full extracted text with [VISUAL: type - description] "
+                        "markers for visual elements"
+                    ),
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # Cached client
 _client: AsyncOpenAI | None = None
@@ -81,9 +133,10 @@ async def extract_document_with_vision(
     """
     Extract text from document using GPT-4o vision.
 
-    Converts document pages to images and processes them in parallel
+    Converts document pages to images and processes them concurrently
     through the vision API for text extraction and visual analysis.
-    Pages are processed using asyncio.gather() for concurrent API calls.
+    Concurrency is limited by an asyncio.Semaphore (VISION_CONCURRENCY,
+    default 5) to avoid overwhelming API rate limits on large documents.
 
     Args:
         file_bytes (bytes): Raw document bytes (PDF or PPTX)
@@ -101,10 +154,11 @@ async def extract_document_with_vision(
     API Details:
         - Uses chat.completions.create() with vision model
         - Images passed as base64 data URIs in content array
-        - response_format={"type": "json_object"} ensures valid JSON
-        - max_tokens=2000 per page request
+        - response_format=json_schema (strict: true) for guaranteed schema
+        - max_tokens=4096 per page request
+        - Semaphore-limited concurrency (default: 5 concurrent pages)
 
-    Last Grunted: 02/05/2026
+    Last Grunted: 02/06/2026
     """
     # Select converter based on file type
     ext = file_extension.lower()
@@ -114,29 +168,34 @@ async def extract_document_with_vision(
         converter = pptx_bytes_to_base64_images
     else:
         return "", "", f"Unsupported file type for vision: {ext}"
-    
+
     # Convert document to images (CPU-bound, run in executor)
     loop = asyncio.get_running_loop()
     images: list[DocumentImage] = await loop.run_in_executor(
         None,
-        lambda: converter(file_bytes, max_pages=VISION_MAX_PAGES)
+        lambda: converter(file_bytes, max_pages=VISION_MAX_PAGES),
     )
-    
+
     if not images:
         return "", "", "Failed to convert document to images"
-    
+
     logger.info(f"Processing {len(images)} pages from {filename}")
-    
+
+    # Semaphore limits concurrent API calls to avoid rate-limit errors.
+    # Default 5 balances throughput vs. OpenAI tier-1 rate limits.
+    semaphore = asyncio.Semaphore(VISION_CONCURRENCY)
+
+    async def _sem_extract(image: DocumentImage) -> str:
+        async with semaphore:
+            return await _extract_page(image, filename, visual_analysis)
+
     try:
-        # Process all pages in parallel
-        tasks = [
-            _extract_page(image, filename, visual_analysis)
-            for image in images
-        ]
+        # Process pages with semaphore-limited concurrency
+        tasks = [_sem_extract(image) for image in images]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Collect successful extractions
-        text_parts = []
+        text_parts: list[str] = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.warning(f"Page {i+1} failed: {result}")
@@ -144,13 +203,13 @@ async def extract_document_with_vision(
             else:
                 page_text = result
                 text_parts.append(f"[Page {images[i].index}]\n{page_text}")
-        
+
         combined_text = "\n\n".join(text_parts)
         logger.info(f"Extracted {len(combined_text)} chars from {filename}")
-        
+
         # Visual info is now embedded inline in text
         return combined_text, "", None
-        
+
     except Exception as exc:
         logger.exception(f"Vision extraction failed: {exc}")
         return "", "", str(exc)

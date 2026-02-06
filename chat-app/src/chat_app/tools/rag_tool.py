@@ -241,14 +241,16 @@ class SearchDocumentContentTool(BaseTool):
     def _extract_collections(config: Optional[RunnableConfig]) -> List[str]:
         """Extract vector collection names from RunnableConfig.
 
+        Tries multiple sources in priority order:
+        1. Explicit vector_collections list in configurable
+        2. Derived from thread_id (thread_{id} collection pattern)
+        3. Empty list (falls back to DEFAULT_COLLECTION in _search)
+
         Args:
-            config: LangGraph config dict with optional
-                configurable.vector_collections list.
+            config: LangGraph config dict with configurable options.
 
         Returns:
-            List[str]: List of collection names. Empty list if not configured.
-
-        Last Grunted: 02/04/2026 06:30:00 PM PST
+            List[str]: List of collection names.
         """
         if config is None:
             return []
@@ -258,10 +260,17 @@ class SearchDocumentContentTool(BaseTool):
         if not isinstance(configurable, dict):
             return []
             
+        # Try explicit vector_collections first
         collections = configurable.get("vector_collections", [])
+        result = [c for c in (collections or []) if c]
         
-        # Filter out empty/None values
-        return [c for c in (collections or []) if c]
+        # Fall back to deriving from thread_id
+        if not result:
+            thread_id = configurable.get("thread_id")
+            if thread_id:
+                result = [f"thread_{thread_id}"]
+        
+        return result
 
     async def _search(
         self,

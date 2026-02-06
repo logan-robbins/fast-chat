@@ -56,10 +56,11 @@ class DocumentImage:
     base64_data: str
 
 
-# Default configuration - sensible defaults, no env vars needed
-DEFAULT_DPI = 150  # Balance between quality and size
-DEFAULT_MAX_EDGE = 1400  # Optimal for GPT-4o vision
-DEFAULT_MAX_PAGES = 20  # Reasonable limit for most documents
+# Default configuration -- matches IngestionConfig defaults.
+# 200 DPI + 1568px max edge gives best quality at GPT-4o's native detail tier.
+DEFAULT_DPI = 200
+DEFAULT_MAX_EDGE = 1568
+DEFAULT_MAX_PAGES = 20
 
 
 def pdf_bytes_to_base64_images(

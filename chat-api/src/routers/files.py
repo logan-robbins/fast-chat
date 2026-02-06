@@ -595,6 +595,33 @@ async def delete_file(
     # Delete from disk asynchronously
     await delete_file_async(file_meta.storage_path)
     
+    # Best-effort: remove file's chunks from vector collection
+    if file_meta.vector_collection:
+        try:
+            from docproc import delete_documents_for_file
+            removed = await delete_documents_for_file(
+                filename=file_meta.filename,
+                collection_name=file_meta.vector_collection,
+            )
+            logger.info(
+                "files.vector_cleanup",
+                file_id=file_id,
+                collection=file_meta.vector_collection,
+                documents_removed=removed,
+            )
+        except ImportError:
+            logger.debug(
+                "files.vector_cleanup_skipped",
+                reason="docproc not installed",
+                file_id=file_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "files.vector_cleanup_failed",
+                file_id=file_id,
+                error=str(e),
+            )
+    
     # Delete from database
     await session.delete(file_meta)
     await session.commit()
@@ -602,13 +629,13 @@ async def delete_file(
     logger.info(
         "files.deleted",
         file_id=file_id,
-        filename=file_meta.filename
+        filename=file_meta.filename,
     )
     
     return FileDeleteResponse(
         id=file_id,
         object="file",
-        deleted=True
+        deleted=True,
     )
 
 
@@ -753,4 +780,47 @@ async def upload_thread_files(
         files_count=len(saved_files)
     )
     
-    return [file_metadata_to_object(f) for f in saved_files]
+    # Auto-process files through docproc pipeline (extract → chunk → embed → store)
+    processing_results = []
+    if saved_files:
+        try:
+            from src.services.file_processor import FileProcessor
+            processor = FileProcessor()
+            processing_results = await processor.process_files(thread_id, saved_files)
+            
+            # Update file metadata with processing results
+            for result in processing_results:
+                for file_meta in saved_files:
+                    if str(file_meta.id) == result.get("file_id"):
+                        file_meta.status = "processed" if result["status"] == "success" else "error"
+                        file_meta.vector_collection = result.get("collection_name")
+                        break
+            
+            await session.commit()
+            
+            logger.info(
+                "files.thread_processing_complete",
+                thread_id=str(thread_id),
+                processed=sum(1 for r in processing_results if r["status"] == "success"),
+                failed=sum(1 for r in processing_results if r["status"] == "error"),
+            )
+        except Exception as e:
+            logger.warning(
+                "files.thread_processing_failed",
+                thread_id=str(thread_id),
+                error=str(e),
+            )
+            # Files are still saved, just not processed
+    
+    # Build response with processing status
+    file_objects = []
+    for f in saved_files:
+        obj = file_metadata_to_object(f)
+        # Add processing info if available
+        for result in processing_results:
+            if result.get("file_id") == str(f.id):
+                obj.status = f.status
+                break
+        file_objects.append(obj)
+    
+    return file_objects

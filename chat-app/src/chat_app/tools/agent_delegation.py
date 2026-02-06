@@ -39,6 +39,7 @@ import traceback
 from typing import Annotated, Any, Dict, List
 
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 
@@ -105,6 +106,7 @@ def create_isolated_handoff_tool(
             "Detailed description of what the agent should do, including all relevant context needed for the task"
         ],
         tool_call_id: Annotated[str, InjectedToolCallId],
+        config: RunnableConfig = None,
     ) -> Command:
         """Execute handoff to agent with isolated context containing only the task description."""
         
@@ -172,9 +174,9 @@ def create_isolated_handoff_tool(
             )
 
             # Execute the agent ASYNCHRONOUSLY with isolated context
-            # Using ainvoke ensures we don't block the event loop
-            # Note: LangGraph automatically propagates parent graph's config to subagent tools
-            result = await agent_instance.ainvoke(isolated_state)
+            # Pass the parent config so subagent tools can access configurable
+            # (e.g., vector_collections for RAG scoping)
+            result = await agent_instance.ainvoke(isolated_state, config=config)
 
             logger.debug(
                 "Agent invocation completed",

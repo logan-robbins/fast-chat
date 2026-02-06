@@ -243,7 +243,9 @@ async def _stream_response(
     config: Dict[str, Any] = {
         "configurable": {
             "thread_id": thread_id,
-            "user_id": request.user_id
+            "user_id": request.user_id,
+            # Scope RAG searches to this thread's vector collection
+            "vector_collections": [f"thread_{thread_id}"],
         }
     }
 
@@ -423,6 +425,7 @@ async def _non_streaming_response(
         "configurable": {
             "thread_id": thread_id,
             "user_id": request.user_id,
+            "vector_collections": [f"thread_{thread_id}"],
         }
     }
     

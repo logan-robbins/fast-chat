@@ -42,15 +42,17 @@ class ProcessingResult:
         status: "success" or "error"
         document_id: Vector store document ID (success only)
         chunks_stored: Number of chunks stored (success only)
+        collection_name: Vector store collection name (success only)
         error: Error message (error only)
         
-    Last Grunted: 02/04/2026 05:30:00 PM UTC
+    Last Grunted: 02/05/2026 06:00:00 PM UTC
     """
     file_id: str
     filename: str
     status: str
     document_id: Optional[str] = None
     chunks_stored: Optional[int] = None
+    collection_name: Optional[str] = None
     error: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -63,6 +65,7 @@ class ProcessingResult:
         if self.status == "success":
             result["document_id"] = self.document_id
             result["chunks_stored"] = self.chunks_stored
+            result["collection_name"] = self.collection_name
         else:
             result["error"] = self.error
         return result
@@ -282,7 +285,8 @@ class FileProcessor:
                 "file_processor.success",
                 filename=filename,
                 document_id=doc_id,
-                chunks_stored=chunks_stored
+                chunks_stored=chunks_stored,
+                collection_name=collection_name,
             )
             
             return ProcessingResult(
@@ -291,6 +295,7 @@ class FileProcessor:
                 status="success",
                 document_id=doc_id,
                 chunks_stored=chunks_stored,
+                collection_name=collection_name,
             )
             
         except FileNotFoundError:

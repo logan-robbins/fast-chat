@@ -13,6 +13,15 @@ Distance metric: Cosine distance (configured via "hnsw:space": "cosine")
 - distance of 0 means identical vectors
 - similarity_score = 1 - distance (converted back to similarity)
 
+Retrieval Features:
+- Metadata filtering: search_similar() accepts a `where` dict for ChromaDB
+  metadata filters ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $and, $or).
+  This replaces the need for separate collections for different document types.
+- Score thresholding: search_similar() accepts a `score_threshold` float to
+  filter out low-relevance results (recommended: 0.3-0.7 depending on use case).
+- Efficient deletion: delete_by_metadata() uses ChromaDB's where clause for
+  bulk deletion without scanning all documents.
+
 Configuration:
 - CHROMA_PERSIST_DIR: Directory for persistence (default: in-memory only)
 - CHROMA_COLLECTION: Default collection name (default: "documents")
@@ -192,6 +201,8 @@ class ChromaVectorStore:
         self,
         query_embedding: list[float],
         limit: int = 5,
+        where: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """
         Search for similar documents using cosine similarity.
@@ -204,6 +215,16 @@ class ChromaVectorStore:
             query_embedding: Query vector. Must match the dimensionality of
                 stored embeddings (e.g., 1536 for text-embedding-3-small).
             limit: Maximum results to return (default: 5)
+            where: Optional ChromaDB metadata filter dict. Supports operators:
+                $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, and logical
+                operators $and, $or.
+                Example: {"filename": "report.pdf"}
+                Example: {"chunk_type": {"$eq": "content"}}
+                Example: {"$and": [{"filename": "report.pdf"}, {"chunk_index": {"$lt": 5}}]}
+            score_threshold: Optional minimum similarity score (0.0-1.0).
+                Results below this threshold are filtered out. Recommended
+                values: 0.3 for broad recall, 0.5 for balanced, 0.7 for
+                high precision. None (default) returns all results.
 
         Returns:
             List of matching documents, each containing:
@@ -216,23 +237,35 @@ class ChromaVectorStore:
         Last Grunted: 02/05/2026
         """
         try:
+            query_kwargs: dict[str, Any] = {
+                "query_embeddings": [query_embedding],
+                "n_results": limit,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where is not None:
+                query_kwargs["where"] = where
+
             results = await asyncio.to_thread(
                 self._collection.query,
-                query_embeddings=[query_embedding],
-                n_results=limit,
-                include=["documents", "metadatas", "distances"],
+                **query_kwargs,
             )
 
             docs = []
             if results["ids"] and results["ids"][0]:
                 for i, doc_id in enumerate(results["ids"][0]):
                     distance = results["distances"][0][i] if results["distances"] else 0
+                    similarity = 1 - distance
+
+                    # Filter by score threshold if specified
+                    if score_threshold is not None and similarity < score_threshold:
+                        continue
+
                     docs.append({
                         "id": doc_id,
                         "text": results["documents"][0][i] if results["documents"] else "",
                         "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
                         "distance": distance,
-                        "similarity_score": 1 - distance,
+                        "similarity_score": similarity,
                     })
             return docs
         except Exception as e:
@@ -255,6 +288,32 @@ class ChromaVectorStore:
             return True
         except Exception as e:
             logger.error(f"ChromaDB delete failed: {e}")
+            return False
+
+    async def delete_by_metadata(self, where: dict[str, Any]) -> bool:
+        """
+        Delete documents matching a metadata filter.
+
+        Uses ChromaDB's native `where` clause for efficient bulk deletion
+        without scanning all documents first. This is significantly faster
+        than get_all + filter + delete for large collections.
+
+        Args:
+            where: ChromaDB metadata filter dict.
+                Example: {"filename": "report.pdf"}
+                Example: {"document_id": "abc123"}
+                Example: {"$and": [{"filename": "report.pdf"}, {"chunk_type": "content"}]}
+
+        Returns:
+            True if deletion succeeded, False on error.
+
+        Last Grunted: 02/05/2026
+        """
+        try:
+            await asyncio.to_thread(self._collection.delete, where=where)
+            return True
+        except Exception as e:
+            logger.error(f"ChromaDB delete_by_metadata failed: {e}")
             return False
 
     async def get_all_documents(self) -> list[dict[str, Any]]:
@@ -330,6 +389,43 @@ class ChromaVectorStore:
             else:
                 clean[key] = str(value)
         return clean
+
+
+async def collection_exists(collection_name: str) -> bool:
+    """Check if a collection exists in ChromaDB.
+
+    Args:
+        collection_name: Name of the collection to check.
+
+    Returns:
+        True if the collection exists, False otherwise.
+
+    Last Grunted: 02/05/2026
+    """
+    try:
+        client = _get_client()
+        collections = await asyncio.to_thread(client.list_collections)
+        return any(c.name == collection_name for c in collections)
+    except Exception as e:
+        logger.error(f"ChromaDB collection_exists check failed: {e}")
+        return False
+
+
+async def list_collections() -> list[str]:
+    """List all collection names in ChromaDB.
+
+    Returns:
+        List of collection name strings.
+
+    Last Grunted: 02/05/2026
+    """
+    try:
+        client = _get_client()
+        collections = await asyncio.to_thread(client.list_collections)
+        return [c.name for c in collections]
+    except Exception as e:
+        logger.error(f"ChromaDB list_collections failed: {e}")
+        return []
 
 
 def get_vector_store(collection_name: str = DEFAULT_COLLECTION) -> ChromaVectorStore:

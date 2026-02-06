@@ -19,6 +19,14 @@ from sqlmodel import Field, SQLModel, Relationship, Column
 from sqlalchemy import JSON
 
 
+def _utcnow_naive() -> datetime:
+    """Return current UTC time as a naive datetime (no tzinfo).
+    
+    PostgreSQL TIMESTAMP WITHOUT TIME ZONE columns require naive datetimes.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class Thread(SQLModel, table=True):
     """
     Conversation thread model.
@@ -52,8 +60,8 @@ class Thread(SQLModel, table=True):
     # Link to LangGraph checkpoint for conversation state
     checkpoint_id: Optional[str] = Field(default=None, index=True)
     checkpoint_ns: Optional[str] = Field(default=None)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
     
     # Metadata fields
     is_pinned: bool = Field(default=False)
@@ -86,7 +94,7 @@ class Message(SQLModel, table=True):
     thread_id: uuid.UUID = Field(foreign_key="thread.id", index=True)
     role: str  # 'user', 'assistant', 'system'
     content: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=_utcnow_naive)
 
     thread: Optional[Thread] = Relationship(back_populates="messages")
 
@@ -122,7 +130,7 @@ class FileMetadata(SQLModel, table=True):
     storage_path: str
     status: str = Field(default="pending")  # pending, uploaded, processed, error
     vector_collection: Optional[str] = Field(default=None)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=_utcnow_naive)
 
 
 class Response(SQLModel, table=True):

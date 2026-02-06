@@ -45,6 +45,9 @@ SHARED_VOLUME_PATH = os.getenv('SHARED_VOLUME_PATH', '/shared-files')
 # Minimum text length to consider PDF text extraction successful
 PDF_TEXT_MIN_CHARS = 200
 
+# Centralized config
+from docproc.config import get_ingestion_config as _get_config
+
 
 class ProcessingStrategy(Enum):
     """Document processing strategies."""
@@ -56,6 +59,8 @@ class ProcessingStrategy(Enum):
 def _detect_strategy(filename: str, visual_analysis: bool) -> ProcessingStrategy:
     """
     Determine optimal processing strategy for a file.
+    
+    Uses the centralized IngestionConfig to check pdf_always_use_vision.
     
     Args:
         filename: Original filename with extension
@@ -82,9 +87,12 @@ def _detect_strategy(filename: str, visual_analysis: bool) -> ProcessingStrategy
     if ext == '.pptx':
         return ProcessingStrategy.VISION_REQUIRED
     
-    # PDF - needs inspection (handled separately)
+    # PDF - route based on config and flags
     if ext == '.pdf':
-        return ProcessingStrategy.VISION_REQUIRED if visual_analysis else ProcessingStrategy.TEXT_ONLY
+        cfg = _get_config()
+        if visual_analysis or cfg.pdf_always_use_vision:
+            return ProcessingStrategy.VISION_REQUIRED
+        return ProcessingStrategy.TEXT_ONLY
     
     # Unknown - try text
     return ProcessingStrategy.TEXT_ONLY
@@ -198,13 +206,16 @@ async def extract_text_from_file(
             return filename, text, None, ""
         
         if strategy == ProcessingStrategy.VISION_REQUIRED:
-            # For PDFs, try text extraction first unless visual_analysis requested
-            if ext == '.pdf' and not visual_analysis:
+            cfg = _get_config()
+            # For PDFs, try pdfplumber first UNLESS vision is forced
+            if ext == '.pdf' and not visual_analysis and not cfg.pdf_always_use_vision:
                 text = await _extract_pdf_text(content)
                 if len(text.strip()) >= PDF_TEXT_MIN_CHARS:
                     logger.info(f"PDF {filename}: text extraction successful ({len(text)} chars)")
                     return filename, text, None, ""
                 logger.info(f"PDF {filename}: insufficient text, using vision")
+            elif ext == '.pdf' and cfg.pdf_always_use_vision:
+                logger.info(f"PDF {filename}: using vision (pdf_always_use_vision=True)")
             
             # Use vision extraction
             from docproc.services.multimodal_extractor import extract_document_with_vision

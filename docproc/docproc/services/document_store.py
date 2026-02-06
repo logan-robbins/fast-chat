@@ -7,10 +7,38 @@ Uses two collections per document set:
 - {collection}_summary: Document summaries (metadata lookup)
 
 Chunking Strategy:
-- Uses RecursiveCharacterTextSplitter from LangChain
-- Default chunk_size: 2000 chars (~500 tokens)
-- Default chunk_overlap: 400 chars (20% overlap for context preservation)
+- Uses RecursiveCharacterTextSplitter.from_tiktoken_encoder() from LangChain
+- Token-aware splitting: splits on character boundaries (paragraphs,
+  sentences, words) but MEASURES chunk size in tokens via tiktoken
+- model_name="gpt-4o": uses the cl200k_base encoding matching OpenAI
+  embedding and chat models for accurate token counting
+- Default chunk_size: 300 tokens — research-optimized for the 256-512 token
+  retrieval sweet spot (see refs below)
+- Default chunk_overlap: 50 tokens (~17%) — 2026 research shows overlap
+  provides marginal benefit above 10-20%
 - Separators: ["\n\n", "\n", ". ", " ", ""] (paragraph > sentence > word)
+- add_start_index=True: Tracks each chunk's character offset in the source
+  document, enabling citation support and debugging
+- Hard constraint: from_tiktoken_encoder recursively splits any chunk
+  exceeding the token limit, unlike CharacterTextSplitter.from_tiktoken_encoder
+  which only measures but doesn't enforce
+
+Why token-aware over pure semantic chunking:
+- SemanticChunker (langchain_experimental) requires embedding API calls
+  during chunking, adding cost and latency
+- SemanticChunker doesn't support add_start_index for citation tracking
+- RecursiveCharacterTextSplitter + tiktoken gives the best balance of
+  quality, speed, and cost for RAG retrieval (LangChain recommended default)
+
+Chunking Research References:
+- "Document Chunking for RAG: 9 Strategies Tested" (langcopilot.com, 2025):
+  256-512 tokens optimal for factoid queries, 1024+ for analytical
+- "Chunk Size Optimization" (arxiv.org, 2026): Sentence chunking most
+  cost-effective; overlap provides no measurable indexing benefit
+- "Chunking Strategies" (weaviate.io): Chunking is the most important
+  factor for RAG performance
+- LangChain docs (docs.langchain.com, 2026): from_tiktoken_encoder
+  provides hard token constraint vs soft measurement
 
 Hashing Strategy:
 - All document IDs use calculate_file_hash(content, filename, model)
@@ -20,7 +48,8 @@ Hashing Strategy:
   check_document_exists(), store_document(), and store_document_with_chunks()
 
 SDK Versions (verified 02/05/2026):
-- langchain-text-splitters>=0.0.1: RecursiveCharacterTextSplitter
+- langchain-text-splitters>=0.3.0: RecursiveCharacterTextSplitter.from_tiktoken_encoder
+- tiktoken>=0.7.0: OpenAI BPE tokenizer (cl200k_base encoding)
 - chromadb>=0.4.22: Vector storage backend
 
 Last Grunted: 02/05/2026
@@ -31,6 +60,7 @@ import os
 from datetime import datetime
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import tiktoken
 
 from docproc.utils.file_helpers import calculate_file_hash, get_content_type
 from docproc.utils.llm_config import get_embeddings_model
@@ -38,10 +68,16 @@ from docproc.utils.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configuration -- loaded from centralized IngestionConfig
+from docproc.config import get_ingestion_config as _get_config
+
+def _cfg():
+    """Lazy config accessor (avoids import-time env read issues in tests)."""
+    c = _get_config()
+    return c
+
+# Backward-compatible module-level accessors
 DEFAULT_COLLECTION = os.getenv("DEFAULT_VECTOR_COLLECTION", "document_summaries")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "2000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "400"))
 
 # Module state
 _embeddings = None
@@ -197,9 +233,10 @@ async def store_document_with_chunks(
     """
     Store document summary and text chunks for RAG retrieval.
 
-    Splits document into overlapping chunks using RecursiveCharacterTextSplitter,
-    generates embeddings for each chunk, and stores them in ChromaDB for
-    semantic search. Also stores the summary separately for quick lookups.
+    Splits document into overlapping chunks using token-aware
+    RecursiveCharacterTextSplitter (via from_tiktoken_encoder), generates
+    embeddings for each chunk, and stores them in ChromaDB for semantic
+    search. Also stores the summary separately for quick lookups.
 
     Args:
         filename: Original filename (e.g., "report.pdf")
@@ -224,10 +261,15 @@ async def store_document_with_chunks(
         a different hash and is stored as a separate document.
 
     Chunking Algorithm:
-        Uses RecursiveCharacterTextSplitter with separators ["\n\n", "\n", ". ", " ", ""]
+        Uses RecursiveCharacterTextSplitter.from_tiktoken_encoder(model_name="gpt-4o")
+        Token-aware: splits on char boundaries, measures size in tokens
+        Separators: ["\n\n", "\n", ". ", " ", ""] (paragraph > sentence > word)
+        add_start_index=True for chunk position tracking
+        Default: 300 tokens, 50 token overlap (~17%)
         Chunk IDs follow pattern: {document_id}_chunk_{index}
+        Each chunk's metadata includes start_index and char_length
 
-    Last Grunted: 02/05/2026
+    Last Grunted: 02/06/2026
     """
     # Generate stable IDs using consistent hash
     file_hash = calculate_file_hash(file_content, filename, model)
@@ -246,13 +288,31 @@ async def store_document_with_chunks(
     processed_at = datetime.now().isoformat()
     content_type = get_content_type(filename)
 
-    # Split text into chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_text(full_text)
+    # Split text into chunks with position tracking using token-aware splitting.
+    # from_tiktoken_encoder splits on character boundaries (preserving paragraphs,
+    # sentences, words) but measures chunk size in tokens via tiktoken. This gives
+    # a hard constraint: any chunk exceeding the token limit is recursively split.
+    # add_start_index=True embeds each chunk's character offset in the source
+    # document as metadata, enabling citation support and chunk tracing.
+    cfg = _cfg()
+    if cfg.chunk_method == "token":
+        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            model_name="gpt-4o",
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            add_start_index=True,
+        )
+    else:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            add_start_index=True,
+        )
+    chunk_docs = splitter.create_documents([full_text])
+    chunks = [doc.page_content for doc in chunk_docs]
+    chunk_start_indices = [doc.metadata.get("start_index", 0) for doc in chunk_docs]
     logger.info(f"Split {filename} into {len(chunks)} chunks")
 
     # Store summary
@@ -291,7 +351,7 @@ async def store_document_with_chunks(
                 embeddings.embed_documents, chunks
             )
 
-            # Prepare batch data
+            # Prepare batch data with position metadata for citation support
             batch_data = []
             for idx, (chunk_text, embedding) in enumerate(zip(chunks, chunk_embeddings)):
                 batch_data.append({
@@ -304,6 +364,8 @@ async def store_document_with_chunks(
                         "chunk_index": idx,
                         "chunk_count": len(chunks),
                         "chunk_type": "content",
+                        "start_index": chunk_start_indices[idx],
+                        "char_length": len(chunk_text),
                         "file_hash": file_hash,
                         "content_type": content_type,
                         "model_used": model,
@@ -325,7 +387,20 @@ async def delete_document(
     filename: str,
     collection_name: str = DEFAULT_COLLECTION,
 ) -> bool:
-    """Delete document and chunks by filename."""
+    """
+    Delete document and chunks by filename.
+
+    Uses ChromaDB's native metadata filter (where clause) for efficient
+    bulk deletion. This avoids the O(n) scan of all documents that the
+    previous get_all + filter + delete pattern required.
+
+    Args:
+        filename: Filename to delete (matches metadata "filename" field)
+        collection_name: Target collection prefix (default: from env)
+
+    Returns:
+        True if deletion succeeded for at least one collection, False on error.
+    """
     try:
         chunk_collection = collection_name or DEFAULT_COLLECTION
         summary_collection = f"{chunk_collection}_summary"
@@ -335,16 +410,9 @@ async def delete_document(
             store = _get_store(collection)
             await _ensure_initialized(collection)
 
-            docs = await store.get_all_documents()
-            doc_ids = [
-                d['id'] for d in docs
-                if d.get('metadata', {}).get('filename') == filename
-            ]
-
-            for doc_id in doc_ids:
-                if await store.delete_document(doc_id):
-                    deleted = True
-                    logger.info(f"Deleted {doc_id} from {collection}")
+            if await store.delete_by_metadata({"filename": filename}):
+                deleted = True
+                logger.info(f"Deleted docs with filename={filename} from {collection}")
 
         return deleted
 
@@ -379,6 +447,55 @@ async def delete_collection(collection_name: str) -> tuple:
     except Exception as e:
         logger.error(f"Collection delete failed: {e}")
         return False, 0
+
+
+async def delete_documents_for_file(
+    filename: str,
+    collection_name: str,
+) -> bool:
+    """Delete all chunks and summary for a specific file from a collection.
+
+    Removes both the chunk documents (from ``collection_name``) and the
+    summary document (from ``{collection_name}_summary``) whose metadata
+    ``filename`` matches the given value.
+
+    Uses ChromaDB's native metadata filter (where clause) for efficient
+    bulk deletion, avoiding an O(n) scan of all documents.
+
+    Args:
+        filename: Original filename used during ingestion.
+        collection_name: The thread-scoped collection prefix
+            (e.g. ``thread_{uuid}``).
+
+    Returns:
+        True if deletion succeeded for at least one collection.
+
+    Last Grunted: 02/05/2026
+    """
+    deleted = False
+    summary_collection = f"{collection_name}_summary"
+
+    for coll_name in (collection_name, summary_collection):
+        try:
+            store = _get_store(coll_name)
+            await _ensure_initialized(coll_name)
+
+            if await store.delete_by_metadata({"filename": filename}):
+                deleted = True
+                logger.info(
+                    "Deleted docs for file '%s' from %s",
+                    filename,
+                    coll_name,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to delete docs for file '%s' from %s: %s",
+                filename,
+                coll_name,
+                e,
+            )
+
+    return deleted
 
 
 async def get_all_documents() -> list[dict]:

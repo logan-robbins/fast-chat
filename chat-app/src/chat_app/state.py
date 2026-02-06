@@ -202,6 +202,9 @@ class ChatAppState(TypedDict):
     
     # Execution metadata
     metadata: Dict[str, Any]
+    
+    # LangGraph 1.0+ requires remaining_steps for agent recursion tracking
+    remaining_steps: int
 
 
 class RoutingDecision(TypedDict):

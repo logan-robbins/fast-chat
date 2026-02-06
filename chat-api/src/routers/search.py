@@ -8,13 +8,29 @@ storage backend from consumers (chat-app).
 Endpoints:
     - POST /v1/search - Semantic search across document collections
 
+Retrieval Features:
+    - Score thresholding: Optional minimum similarity score to filter out
+      low-relevance results (recommended: 0.3-0.7 depending on use case)
+    - Metadata filtering: Optional ChromaDB where clause to narrow search
+      scope by document metadata (filename, content_type, etc.)
+    - Async embedding: Query embedding generation is offloaded to a thread
+      to avoid blocking the event loop
+
 Architecture:
     chat-api owns the vector store. chat-app and other consumers call this
     endpoint for RAG queries. When migrating to a managed vector DB (Pinecone,
     Weaviate, etc.), only this module needs to change.
 
+Future Improvements (documented from 2026 research):
+    - Hybrid search: Combine dense (embedding) + sparse (BM25) retrieval
+      for 20-40% accuracy improvement (Anthropic contextual retrieval)
+    - Reranking: Cross-encoder reranking step (Cohere Rerank, BGE Reranker)
+      for ~33-40% accuracy improvement on top of initial retrieval
+
 Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
+import asyncio
+
 import structlog
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +55,12 @@ class SearchRequest(BaseModel):
         query: Natural language search query
         collections: List of collection names to search (default: ["documents"])
         limit: Maximum number of results (1-50, default 5)
+        score_threshold: Optional minimum similarity score (0.0-1.0). Results
+            below this threshold are excluded. Recommended: 0.3 for broad recall,
+            0.5 for balanced precision/recall, 0.7 for high precision.
+        where: Optional ChromaDB metadata filter dict. Narrows search to
+            documents matching the filter criteria.
+            Examples: {"filename": "report.pdf"}, {"content_type": "application/pdf"}
     """
     query: str = Field(..., min_length=1, description="Search query string")
     collections: List[str] = Field(
@@ -46,6 +68,16 @@ class SearchRequest(BaseModel):
         description="Collection names to search"
     )
     limit: int = Field(default=5, ge=1, le=50, description="Maximum results")
+    score_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum similarity score (0.0-1.0). None returns all results.",
+    )
+    where: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="ChromaDB metadata filter (e.g. {\"filename\": \"report.pdf\"})",
+    )
 
 
 class SearchResult(BaseModel):
@@ -155,10 +187,12 @@ async def search_documents(request: SearchRequest):
     except RuntimeError as e:
         return internal_error(str(e))
     
-    # Generate query embedding
+    # Generate query embedding (offloaded to thread to avoid blocking event loop)
     try:
         embeddings = get_embeddings_model()
-        query_embedding = embeddings.embed_query(request.query)
+        query_embedding = await asyncio.to_thread(
+            embeddings.embed_query, request.query
+        )
     except Exception as e:
         logger.error(
             "search.embedding_failed",
@@ -176,8 +210,10 @@ async def search_documents(request: SearchRequest):
             await store.initialize()
             
             results = await store.search_similar(
-                query_embedding, 
-                limit=request.limit
+                query_embedding,
+                limit=request.limit,
+                where=request.where,
+                score_threshold=request.score_threshold,
             )
             
             for result in results:

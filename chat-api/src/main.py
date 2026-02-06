@@ -145,27 +145,27 @@ async def lifespan(app: FastAPI):
     Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     # Startup
-    logger.info("chat_api.startup", event="starting")
+    logger.info("chat_api.startup")
     
     try:
-        logger.info("chat_api.database.init", event="initializing_database")
+        logger.info("chat_api.database.init")
         await init_db()
-        logger.info("chat_api.database.ready", event="database_initialized")
+        logger.info("chat_api.database.ready")
     except Exception as e:
-        logger.error("chat_api.database.error", event="database_init_failed", error=str(e))
+        logger.error("chat_api.database.error", error=str(e))
         raise
     
-    logger.info("chat_api.ready", event="startup_complete")
+    logger.info("chat_api.ready")
     
     yield
     
     # Shutdown
-    logger.info("chat_api.shutdown", event="shutting_down")
+    logger.info("chat_api.shutdown")
     
     await close_client()
     await close_db()
     
-    logger.info("chat_api.shutdown.complete", event="shutdown_complete")
+    logger.info("chat_api.shutdown.complete")
 
 
 # ============================================================================

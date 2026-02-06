@@ -8,6 +8,12 @@ Configuration (environment variables):
 - OPENAI_API_KEY: Required for all operations (cloud mode)
 - LLM_MODEL: Chat model to use (default: gpt-4o-mini)
 - EMBEDDING_MODEL: Embedding model (default: text-embedding-3-small, 1536 dims)
+- EMBEDDING_DIMENSIONS: Optional dimension override for text-embedding-3 models.
+  OpenAI's text-embedding-3-* models support a `dimensions` parameter that
+  truncates the output vector. This enables:
+  - Using text-embedding-3-large at 1536 dims for better quality at same storage cost
+  - Using text-embedding-3-small at 512 or 256 dims for reduced storage/faster search
+  Leave unset to use the model's native dimensionality.
 
 Local development fallback (optional):
 - USE_LOCAL_MODELS: Set to "true" to use Ollama instead of OpenAI
@@ -21,6 +27,17 @@ WARNING - Embedding Dimension Mismatch:
     Switching between cloud and local WILL BREAK existing ChromaDB collections
     because HNSW index dimensionality is locked at first insert. You MUST delete
     and recreate all collections when changing embedding modes.
+
+    The same applies when changing EMBEDDING_DIMENSIONS — the HNSW index is
+    locked to the dimensionality of the first insert.
+
+Embedding Model Selection (2026 research):
+    text-embedding-3-small: ELO 1503, nDCG@10 0.762, 1536 dims, $0.020/1M tokens
+    text-embedding-3-large: ELO 1539, nDCG@10 0.811, 3072 dims, $0.130/1M tokens
+    text-embedding-3-large is ~36 ELO better but 6.5x the cost. For most RAG
+    use cases, text-embedding-3-small at native 1536 dims is the best
+    price/performance choice. Use text-embedding-3-large at 1536 dims
+    (via EMBEDDING_DIMENSIONS=1536) when accuracy is critical.
 
 SDK Versions (verified 02/05/2026):
 - langchain>=0.1.0
@@ -41,6 +58,12 @@ USE_LOCAL_MODELS = os.getenv('USE_LOCAL_MODELS', 'false').lower() == 'true'
 # Model defaults - using current best price/performance options
 DEFAULT_CHAT_MODEL = os.getenv('LLM_MODEL', 'gpt-4o-mini')
 DEFAULT_EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')
+
+# Optional: Override embedding output dimensions for text-embedding-3-* models.
+# Leave unset (empty) to use the model's native dimensionality.
+# Common values: 256, 512, 1024, 1536, 3072
+_raw_dims = os.getenv('EMBEDDING_DIMENSIONS', '')
+EMBEDDING_DIMENSIONS: int | None = int(_raw_dims) if _raw_dims.strip() else None
 
 # Local fallback configuration (only used if USE_LOCAL_MODELS=true)
 OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
@@ -116,10 +139,12 @@ def get_embeddings_model():
     Get a LangChain embeddings model. Defaults to OpenAI cloud.
     
     Model details:
-    - Cloud: text-embedding-3-small (1536 dims, $0.00002/1K tokens)
+    - Cloud: text-embedding-3-small (1536 dims, $0.020/1M tokens)
       Normalized to unit length. Use cosine similarity for search.
       OpenAI recommends cosine similarity; with normalized vectors,
       cosine similarity equals dot product.
+      Supports `dimensions` parameter for output truncation via
+      EMBEDDING_DIMENSIONS env var.
     - Local: nomic-embed-text (768 dims) - dedicated embedding model,
       NOT a chat model repurposed for embeddings.
     
@@ -135,6 +160,7 @@ def get_embeddings_model():
         Cloud (1536 dims) and local (768 dims) produce INCOMPATIBLE vectors.
         Switching modes requires deleting and recreating all ChromaDB collections.
         HNSW index dimensionality is fixed at first insert and cannot be changed.
+        Changing EMBEDDING_DIMENSIONS also requires collection recreation.
 
     Note:
         For batch embedding, use embed_documents() which is more efficient
@@ -152,12 +178,24 @@ def get_embeddings_model():
     
     # Cloud mode (default)
     _, OpenAIEmbeddings = _get_openai_classes()
-    logger.debug(f"Using OpenAI embeddings: {DEFAULT_EMBEDDING_MODEL}")
-    return OpenAIEmbeddings(model=DEFAULT_EMBEDDING_MODEL)
+    kwargs: dict = {"model": DEFAULT_EMBEDDING_MODEL}
+    if EMBEDDING_DIMENSIONS is not None:
+        kwargs["dimensions"] = EMBEDDING_DIMENSIONS
+        logger.debug(
+            f"Using OpenAI embeddings: {DEFAULT_EMBEDDING_MODEL} "
+            f"(dimensions={EMBEDDING_DIMENSIONS})"
+        )
+    else:
+        logger.debug(f"Using OpenAI embeddings: {DEFAULT_EMBEDDING_MODEL}")
+    return OpenAIEmbeddings(**kwargs)
 
 
 # Log configuration on module load
 if USE_LOCAL_MODELS:
     logger.info(f"LLM Config: Local mode (Ollama at {OLLAMA_BASE_URL})")
 else:
-    logger.info(f"LLM Config: Cloud mode (OpenAI {DEFAULT_CHAT_MODEL})")
+    _dims_info = f", dims={EMBEDDING_DIMENSIONS}" if EMBEDDING_DIMENSIONS else ""
+    logger.info(
+        f"LLM Config: Cloud mode (OpenAI {DEFAULT_CHAT_MODEL}, "
+        f"embed={DEFAULT_EMBEDDING_MODEL}{_dims_info})"
+    )
