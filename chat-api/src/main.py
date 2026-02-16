@@ -52,7 +52,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.db.engine import init_db, close_db, check_db_health
 from src.services.http_client import close_client
-from src.routers import chat, files, models, responses, search
+from src.routers import admin, chat, files, models, responses, search
 from src.services.observability import get_metric_snapshot, get_audit_events
 
 
@@ -413,6 +413,7 @@ app.include_router(files.router, tags=["files"])
 app.include_router(models.router, tags=["models"])
 app.include_router(responses.router, tags=["responses"])
 app.include_router(search.router, tags=["search"])
+app.include_router(admin.router, tags=["admin"])
 
 
 # ============================================================================
