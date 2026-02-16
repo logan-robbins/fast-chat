@@ -37,7 +37,9 @@ from docproc.services.document_store import (
     ensure_vector_store_initialized,
 )
 from docproc.utils.vector_store import (
+    VectorStoreAdapter,
     ChromaVectorStore,
+    InMemoryVectorStore,
     get_vector_store,
     collection_exists,
     list_collections,
@@ -68,7 +70,9 @@ __all__ = [
     "clear_all_documents",
     "ensure_vector_store_initialized",
     # Vector store
+    "VectorStoreAdapter",
     "ChromaVectorStore",
+    "InMemoryVectorStore",
     "get_vector_store",
     "collection_exists",
     "list_collections",

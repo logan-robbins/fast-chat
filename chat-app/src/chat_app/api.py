@@ -46,6 +46,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
 from chat_app.graphs.app import app as graph
+from chat_app.services.graph_registry import resolve_graph_version, is_hot_reload_enabled
 
 # Setup Logging
 logger = logging.getLogger(__name__)
@@ -240,10 +241,13 @@ async def _stream_response(
         "messages": _convert_messages(request.messages),
     }
     
+    graph_version = resolve_graph_version(request.user_id)
     config: Dict[str, Any] = {
         "configurable": {
             "thread_id": thread_id,
             "user_id": request.user_id,
+            "graph_version": graph_version,
+            "hot_reload_enabled": is_hot_reload_enabled(),
             # Scope RAG searches to this thread's vector collection
             "vector_collections": [f"thread_{thread_id}"],
         }
@@ -421,10 +425,13 @@ async def _non_streaming_response(
         "messages": _convert_messages(request.messages),
     }
     
+    graph_version = resolve_graph_version(request.user_id)
     config: Dict[str, Any] = {
         "configurable": {
             "thread_id": thread_id,
             "user_id": request.user_id,
+            "graph_version": graph_version,
+            "hot_reload_enabled": is_hot_reload_enabled(),
             "vector_collections": [f"thread_{thread_id}"],
         }
     }

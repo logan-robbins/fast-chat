@@ -23,6 +23,8 @@ import structlog
 from dataclasses import dataclass
 from typing import Optional
 
+from src.services.model_policy import resolve_fallback_chain
+
 logger = structlog.get_logger(__name__)
 
 
@@ -319,3 +321,13 @@ def get_model_objects() -> list[dict]:
         }
         for spec in _MODELS.values()
     ]
+
+
+def get_resolved_model_chain(requested_model: str) -> list[str]:
+    """Return declarative fallback chain filtered to supported models."""
+    chain = resolve_fallback_chain(requested_model)
+    resolved: list[str] = []
+    for model in chain:
+        if is_model_supported(model) and model not in resolved:
+            resolved.append(model)
+    return resolved or [requested_model]
