@@ -54,7 +54,7 @@ from typing import List, Optional, Union, Dict, Any, Literal
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select as sa_select
@@ -65,7 +65,15 @@ from src.db.engine import get_session
 from src.db.models import Thread, Message
 from src.services.title_generator import generate_title_with_fallback
 from src.services.http_client import get_client, CHAT_APP_URL
-from src.services.model_registry import is_model_supported, get_context_limit
+from src.services.model_registry import is_model_supported, get_context_limit, get_resolved_model_chain
+from src.services.model_policy import get_model_policy, is_model_allowed
+from src.services.request_context import (
+    extract_request_context,
+    is_tenant_allowed,
+    is_role_allowed_for_model,
+    is_abac_allowed_for_model,
+)
+from src.services.observability import emit_audit_event, record_metric
 from src.services.tokens import count_tokens, count_chat_message_tokens
 from src.services.errors import (
     create_error_response,
@@ -173,6 +181,7 @@ class StreamOptions(BaseModel):
     """
     include_usage: bool = False
     include_status: bool = True
+    event_envelope: Literal["legacy", "canonical"] = "legacy"
 
 
 # ============================================================================
@@ -405,6 +414,7 @@ class ChatCompletionChunk(BaseModel):
 @router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
+    http_request: Request,
     session: AsyncSession = Depends(get_session)
 ):
     """
@@ -502,9 +512,47 @@ async def create_chat_completion(
         
     Last Grunted: 02/04/2026 08:00:00 PM UTC
     """
+    ctx = extract_request_context(http_request)
+    if not is_tenant_allowed(ctx):
+        return create_error_response(
+            message="Tenant is not allowed by policy",
+            error_type="permission_error",
+            param="x-tenant-id",
+            code="tenant_policy_denied",
+            status_code=403,
+        )
+
     # Validate model via shared registry (supports dated variants)
     if not is_model_supported(request.model):
         return model_not_found_error(request.model)
+
+    policy = get_model_policy()
+    if not is_model_allowed(request.model, policy.allowed_families):
+        return create_error_response(
+            message=f"Model '{request.model}' is not allowed by policy",
+            error_type="permission_error",
+            param="model",
+            code="model_policy_denied",
+            status_code=403,
+        )
+
+    if not is_role_allowed_for_model(request.model, ctx):
+        return create_error_response(
+            message="Role is not allowed for requested model",
+            error_type="permission_error",
+            param="x-user-role",
+            code="role_policy_denied",
+            status_code=403,
+        )
+
+    if not is_abac_allowed_for_model(request.model, ctx):
+        return create_error_response(
+            message="Attribute policy denied model access",
+            error_type="permission_error",
+            param="x-user-attrs",
+            code="abac_policy_denied",
+            status_code=403,
+        )
     
     # Validate messages
     if not request.messages:
@@ -568,7 +616,11 @@ async def create_chat_completion(
         "frequency_penalty": request.frequency_penalty,
         # BFF extensions for backend
         "thread_id": str(thread.id),
-        "user_id": str(thread.user_id)
+        "user_id": str(thread.user_id),
+        "tenant_id": ctx.tenant_id,
+        "user_role": ctx.role,
+        "workspace": ctx.workspace,
+        "user_attributes": ctx.attributes,
     }
     
     logger.info(
@@ -578,6 +630,7 @@ async def create_chat_completion(
         stream=request.stream,
         prompt_tokens=prompt_tokens
     )
+    emit_audit_event("chat.request", model=request.model, thread_id=str(thread.id), stream=bool(request.stream), tenant_id=ctx.tenant_id)
     
     # Extract stream_options for usage and status tracking
     include_usage = (
@@ -588,18 +641,26 @@ async def create_chat_completion(
         request.stream_options.include_status 
         if request.stream_options else True  # Default: include status events
     )
+    event_envelope = (
+        request.stream_options.event_envelope
+        if request.stream_options else "legacy"
+    )
     
+    model_chain = get_resolved_model_chain(request.model)
+
     if request.stream:
         return await _handle_streaming_response(
             backend_payload, completion_id, created_timestamp, 
             request.model, prompt_tokens, thread, session,
             include_usage=include_usage,
-            include_status=include_status
+            include_status=include_status,
+            event_envelope=event_envelope
         )
     else:
         return await _handle_non_streaming_response(
             backend_payload, completion_id, created_timestamp,
-            request.model, prompt_tokens, thread, session
+            request.model, prompt_tokens, thread, session,
+            model_chain=model_chain
         )
 
 
@@ -612,7 +673,8 @@ async def _handle_streaming_response(
     thread: Thread,
     session: AsyncSession,
     include_usage: bool = False,
-    include_status: bool = True
+    include_status: bool = True,
+    event_envelope: str = "legacy"
 ) -> StreamingResponse:
     """
     Handle streaming chat completion response with extended event forwarding.
@@ -718,7 +780,16 @@ async def _handle_streaming_response(
     thread_id = thread.id
     _include_usage = include_usage
     _include_status = include_status
+    _event_envelope = event_envelope
     _prompt_tokens = prompt_tokens
+
+    def _emit_canonical(event_name: str, payload: dict[str, Any]) -> str:
+        envelope = {
+            "schema": "fastchat.stream.v1",
+            "event": event_name,
+            "payload": payload,
+        }
+        return f"event: fc_event\ndata: {json.dumps(envelope)}\n\n"
     
     async def stream_generator():
         # Use shared HTTP client for connection pooling
@@ -818,6 +889,8 @@ async def _handle_streaming_response(
                                                 "is_final": False
                                             }
                                             yield f"event: usage\ndata: {json.dumps(running_usage)}\n\n"
+                                        if _event_envelope == "canonical":
+                                            yield _emit_canonical("usage", running_usage)
                                 
                                 # Handle status events (ChatGPT/Claude-style)
                                 elif current_event_type == "status":
@@ -833,6 +906,8 @@ async def _handle_streaming_response(
                                                 message=status_message[:50]
                                             )
                                             yield f"event: status\ndata: {json.dumps(event_data)}\n\n"
+                                            if _event_envelope == "canonical":
+                                                yield _emit_canonical("status", event_data)
                                 
                                 else:
                                     # Forward other extended events (agent_start, progress, complete, etc.)
@@ -895,6 +970,8 @@ async def _handle_streaming_response(
                                     "is_final": True
                                 }
                                 yield f"event: usage\ndata: {json.dumps(extended_usage)}\n\n"
+                                if _event_envelope == "canonical":
+                                    yield _emit_canonical("usage", extended_usage)
                             
                             # Persist assistant response BEFORE [DONE] to avoid
                             # async generator cleanup issues with Starlette.
@@ -961,6 +1038,8 @@ async def _handle_streaming_response(
                                             "is_final": False
                                         }
                                         yield f"event: usage\ndata: {json.dumps(running_usage)}\n\n"
+                                        if _event_envelope == "canonical":
+                                            yield _emit_canonical("usage", running_usage)
                             else:
                                 # Other data events - extract content if present
                                 choices = chunk_data.get("choices", [])
@@ -998,6 +1077,8 @@ async def _handle_streaming_response(
                                                 "is_final": False
                                             }
                                             yield f"event: usage\ndata: {json.dumps(running_usage)}\n\n"
+                                        if _event_envelope == "canonical":
+                                            yield _emit_canonical("usage", running_usage)
                         except json.JSONDecodeError:
                             pass
                         
@@ -1046,7 +1127,8 @@ async def _handle_non_streaming_response(
     model: str,
     prompt_tokens: int,
     thread: Thread,
-    session: AsyncSession
+    session: AsyncSession,
+    model_chain: list[str] | None = None,
 ) -> ChatCompletionResponse:
     """
     Handle non-streaming chat completion response.
@@ -1076,17 +1158,31 @@ async def _handle_non_streaming_response(
     # Use shared HTTP client for connection pooling
     client = await get_client()
     
+    t0 = time.monotonic()
     try:
-        response = await client.post(CHAT_APP_URL, json=backend_payload)
-        
-        if response.status_code != 200:
+        chain = model_chain or [model]
+        response = None
+        selected_model = model
+        last_status = 500
+        for candidate in chain:
+            payload = dict(backend_payload)
+            payload["model"] = candidate
+            candidate_resp = await client.post(CHAT_APP_URL, json=payload)
+            last_status = candidate_resp.status_code
+            if candidate_resp.status_code == 200:
+                response = candidate_resp
+                selected_model = candidate
+                break
             logger.warning(
-                "chat.completion.backend_error",
+                "chat.completion.backend_retry",
                 completion_id=completion_id,
-                status_code=response.status_code
+                candidate_model=candidate,
+                status_code=candidate_resp.status_code
             )
-            return backend_error(response.status_code)
-        
+        if response is None:
+            record_metric("chat_nonstream", (time.monotonic() - t0) * 1000, False)
+            return backend_error(last_status)
+
         backend_response = response.json()
         
         # Extract content from backend response
@@ -1096,7 +1192,7 @@ async def _handle_non_streaming_response(
             content = message.get("content", "")
         
         # Calculate completion tokens using tiktoken
-        completion_tokens = count_tokens(content, model)
+        completion_tokens = count_tokens(content, selected_model)
         
         # Persist assistant response
         if content:
@@ -1111,17 +1207,18 @@ async def _handle_non_streaming_response(
         logger.info(
             "chat.completion.success",
             completion_id=completion_id,
-            model=model,
+            model=selected_model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens
         )
         
         # Build OpenAI-compliant response
+        record_metric("chat_nonstream", (time.monotonic() - t0) * 1000, True)
         return ChatCompletionResponse(
             id=completion_id,
             object="chat.completion",
             created=created_timestamp,
-            model=model,
+            model=selected_model,
             choices=[ChatCompletionChoice(
                 index=0,
                 message=ChatMessage(
@@ -1143,6 +1240,7 @@ async def _handle_non_streaming_response(
             "chat.completion.timeout",
             completion_id=completion_id
         )
+        record_metric("chat_nonstream", (time.monotonic() - t0) * 1000, False)
         return timeout_error("backend request")
         
     except Exception as e:
@@ -1151,6 +1249,7 @@ async def _handle_non_streaming_response(
             completion_id=completion_id,
             error=str(e)
         )
+        record_metric("chat_nonstream", (time.monotonic() - t0) * 1000, False)
         return internal_error(str(e))
 
 

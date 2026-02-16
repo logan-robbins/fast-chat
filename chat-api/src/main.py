@@ -53,6 +53,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.db.engine import init_db, close_db, check_db_health
 from src.services.http_client import close_client
 from src.routers import chat, files, models, responses, search
+from src.services.observability import get_metric_snapshot, get_audit_events
 
 
 # ============================================================================
@@ -485,3 +486,15 @@ async def liveness_check():
     Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
     return {"status": "alive"}
+
+
+@app.get("/internal/metrics")
+async def internal_metrics() -> dict:
+    """Internal SLO metrics snapshot."""
+    return {"metrics": get_metric_snapshot()}
+
+
+@app.get("/internal/audit")
+async def internal_audit(limit: int = 100) -> dict:
+    """Internal audit event buffer snapshot."""
+    return {"events": get_audit_events(limit=limit)}

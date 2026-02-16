@@ -40,6 +40,13 @@ import httpx
 from src.db.models import Response, ResponseInputItem
 from src.services.http_client import get_client, CHAT_APP_URL
 from src.services.model_registry import is_model_supported
+from src.services.model_policy import get_model_policy, is_model_allowed
+from src.services.request_context import (
+    extract_request_context,
+    is_tenant_allowed,
+    is_role_allowed_for_model,
+    is_abac_allowed_for_model,
+)
 from src.services.tokens import count_tokens, count_input_tokens, estimate_tokens
 from src.services.errors import (
     create_error_response,
@@ -634,6 +641,7 @@ async def get_previous_context(
 @router.post("/v1/responses", response_model=ResponseObject)
 async def create_response(
     request: CreateResponseRequest,
+    http_request: Request,
     session: AsyncSession = Depends(get_session)
 ):
     """
@@ -663,6 +671,16 @@ async def create_response(
         
     Last Grunted: 02/04/2026 05:30:00 PM UTC
     """
+    ctx = extract_request_context(http_request)
+    if not is_tenant_allowed(ctx):
+        return create_error_response(
+            message="Tenant is not allowed by policy",
+            error_type="permission_error",
+            param="x-tenant-id",
+            code="tenant_policy_denied",
+            status_code=403,
+        )
+
     # Generate IDs and timestamps
     response_id = generate_response_id()
     message_id = generate_message_id()
@@ -671,6 +689,34 @@ async def create_response(
     # Validate model via shared registry (supports dated variants)
     if not is_model_supported(request.model):
         return model_not_found_error(request.model)
+
+    policy = get_model_policy()
+    if not is_model_allowed(request.model, policy.allowed_families):
+        return create_error_response(
+            message=f"Model '{request.model}' is not allowed by policy",
+            error_type="permission_error",
+            param="model",
+            code="model_policy_denied",
+            status_code=403,
+        )
+
+    if not is_role_allowed_for_model(request.model, ctx):
+        return create_error_response(
+            message="Role is not allowed for requested model",
+            error_type="permission_error",
+            param="x-user-role",
+            code="role_policy_denied",
+            status_code=403,
+        )
+
+    if not is_abac_allowed_for_model(request.model, ctx):
+        return create_error_response(
+            message="Attribute policy denied model access",
+            error_type="permission_error",
+            param="x-user-attrs",
+            code="abac_policy_denied",
+            status_code=403,
+        )
     
     # Validate metadata (max 16 pairs)
     if request.metadata and len(request.metadata) > 16:

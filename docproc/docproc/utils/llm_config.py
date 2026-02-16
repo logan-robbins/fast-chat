@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 # Cloud-first: Default to OpenAI
 USE_LOCAL_MODELS = os.getenv('USE_LOCAL_MODELS', 'false').lower() == 'true'
+DEPLOYMENT_PROFILE = os.getenv('DEPLOYMENT_PROFILE', 'oss').lower()
+LITELLM_BASE_URL = os.getenv('LITELLM_BASE_URL', '').strip()
+
+if DEPLOYMENT_PROFILE == 'enterprise' and USE_LOCAL_MODELS:
+    raise RuntimeError('USE_LOCAL_MODELS is not allowed in DEPLOYMENT_PROFILE=enterprise; route through LiteLLM/OpenAI gateway instead.')
 
 # Model defaults - using current best price/performance options
 DEFAULT_CHAT_MODEL = os.getenv('LLM_MODEL', 'gpt-4o-mini')
@@ -76,6 +81,15 @@ def _get_openai_classes():
     """Lazy import OpenAI LangChain classes."""
     from langchain_openai import ChatOpenAI, OpenAIEmbeddings
     return ChatOpenAI, OpenAIEmbeddings
+
+
+
+
+def _get_openai_runtime_kwargs() -> dict:
+    """Return provider routing kwargs for ChatOpenAI/OpenAIEmbeddings."""
+    if LITELLM_BASE_URL:
+        return {"base_url": LITELLM_BASE_URL}
+    return {}
 
 
 @lru_cache(maxsize=1)
@@ -131,7 +145,8 @@ def get_llm_model(model_name: str = None):
     ChatOpenAI, _ = _get_openai_classes()
     effective_model = model_name or DEFAULT_CHAT_MODEL
     logger.debug(f"Using OpenAI model: {effective_model}")
-    return ChatOpenAI(model=effective_model, temperature=0)
+    kwargs = _get_openai_runtime_kwargs()
+    return ChatOpenAI(model=effective_model, temperature=0, **kwargs)
 
 
 def get_embeddings_model():
@@ -178,7 +193,7 @@ def get_embeddings_model():
     
     # Cloud mode (default)
     _, OpenAIEmbeddings = _get_openai_classes()
-    kwargs: dict = {"model": DEFAULT_EMBEDDING_MODEL}
+    kwargs: dict = {"model": DEFAULT_EMBEDDING_MODEL, **_get_openai_runtime_kwargs()}
     if EMBEDDING_DIMENSIONS is not None:
         kwargs["dimensions"] = EMBEDDING_DIMENSIONS
         logger.debug(
