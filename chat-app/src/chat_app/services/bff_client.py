@@ -69,6 +69,7 @@ async def get_client() -> httpx.AsyncClient:
                 max_connections=50,
                 max_keepalive_connections=10,
             ),
+            trust_env=False,  # Keep internal service traffic off configured HTTP proxies
         )
     
     return _client

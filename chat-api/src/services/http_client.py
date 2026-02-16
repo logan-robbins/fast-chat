@@ -135,6 +135,7 @@ async def get_client() -> httpx.AsyncClient:
             limits=_create_limits(),
             timeout=_create_timeout(),
             http2=True,  # Enable HTTP/2 for better performance
+            trust_env=False,  # Do not route internal service calls via proxy env vars
         )
     
     return _client

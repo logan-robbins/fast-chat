@@ -19,7 +19,16 @@ from functools import lru_cache
 
 # Environment-based configuration for NIM (NVIDIA Inference Microservice) support
 # When set, routes LLM calls through NIM endpoint instead of OpenAI API
-OPENAI_BASE_URL: Optional[str] = os.getenv("OPENAI_BASE_URL")
+_raw_openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
+# Normalize legacy proxy-style OpenAI URL to canonical OpenAI v1 endpoint.
+if _raw_openai_base_url and _raw_openai_base_url.rstrip("/") == "https://api.openai.com:18080":
+    OPENAI_BASE_URL: Optional[str] = "https://api.openai.com/v1"
+else:
+    OPENAI_BASE_URL = _raw_openai_base_url
+
+if OPENAI_BASE_URL:
+    os.environ["OPENAI_BASE_URL"] = OPENAI_BASE_URL
+
 NIM_MODEL_NAME: Optional[str] = os.getenv("NIM_MODEL_NAME")
 
 

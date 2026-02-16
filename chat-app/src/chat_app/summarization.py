@@ -74,7 +74,7 @@ async def summarize_messages(
     if not messages:
         return existing_summary
     
-    model = init_chat_model("openai:gpt-4o-mini", temperature=0.0)
+    model = init_chat_model("openai:gpt-4o-mini", temperature=0.0, use_responses_api=False)
     
     formatted = format_messages_for_summary(messages)
     

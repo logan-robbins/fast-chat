@@ -501,7 +501,7 @@ async def pre_model_hook(
                             top_score=search_results[0].score if search_results else 0,
                         )
                 except Exception as e:
-                    logger.warning("pre_model_hook.rag_prefetch_failed", error=str(e))
+                    logger.warning("pre_model_hook.rag_prefetch_failed: %s", str(e))
     
     # Build intent context if classification is available
     intent_context = ""
@@ -664,12 +664,14 @@ def create_supervisor_graph(agents: Dict[str, Dict[str, Any]]):
         supervisor_model = init_chat_model(
             f"openai:{model_name}",
             temperature=0.0,
+            use_responses_api=False,
             tags=["supervisor"]
         )
     else:
         supervisor_model = init_chat_model(
             "openai:gpt-4o",
             temperature=0.0,
+            use_responses_api=False,
             tags=["supervisor"]
         )
     

@@ -119,6 +119,7 @@ def _get_agent_model(
         model,
         temperature=temp,
         streaming=True,
+        use_responses_api=False,
         tags=tags or []
     )
 

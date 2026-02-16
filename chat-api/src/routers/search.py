@@ -30,6 +30,7 @@ Future Improvements (documented from 2026 research):
 Last Grunted: 02/05/2026 12:00:00 PM UTC
 """
 import asyncio
+import os
 
 import structlog
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,18 @@ from src.services.errors import internal_error
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+def _embed_query_compat(query: str, model: str) -> List[float]:
+    """Compatibility embedding call for providers that reject `encoding_format`."""
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("LITELLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+    )
+    response = client.embeddings.create(model=model, input=query)
+    return response.data[0].embedding
 
 
 # ============================================================================
@@ -194,12 +207,34 @@ async def search_documents(request: SearchRequest):
             embeddings.embed_query, request.query
         )
     except Exception as e:
+        error_text = str(e)
         logger.error(
             "search.embedding_failed",
-            error=str(e),
+            error=error_text,
             query_preview=request.query[:50],
         )
-        return internal_error(f"Failed to generate query embedding: {e}")
+
+        # Compatibility fallback for OpenAI-compatible providers that do not
+        # support the `encoding_format` parameter used by some SDK paths.
+        if "Unknown parameter: 'encoding_format'" in error_text:
+            try:
+                embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+                query_embedding = await asyncio.to_thread(
+                    _embed_query_compat,
+                    request.query,
+                    embedding_model,
+                )
+                logger.info(
+                    "search.embedding_fallback_success",
+                    model=embedding_model,
+                    query_preview=request.query[:50],
+                )
+            except Exception as fallback_error:
+                return internal_error(
+                    f"Failed to generate query embedding: {fallback_error}"
+                )
+        else:
+            return internal_error(f"Failed to generate query embedding: {e}")
     
     all_results: List[SearchResult] = []
     

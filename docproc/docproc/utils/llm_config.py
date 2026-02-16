@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 USE_LOCAL_MODELS = os.getenv('USE_LOCAL_MODELS', 'false').lower() == 'true'
 DEPLOYMENT_PROFILE = os.getenv('DEPLOYMENT_PROFILE', 'oss').lower()
 LITELLM_BASE_URL = os.getenv('LITELLM_BASE_URL', '').strip()
+OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', '').strip()
 
 if DEPLOYMENT_PROFILE == 'enterprise' and USE_LOCAL_MODELS:
     raise RuntimeError('USE_LOCAL_MODELS is not allowed in DEPLOYMENT_PROFILE=enterprise; route through LiteLLM/OpenAI gateway instead.')
@@ -89,6 +90,13 @@ def _get_openai_runtime_kwargs() -> dict:
     """Return provider routing kwargs for ChatOpenAI/OpenAIEmbeddings."""
     if LITELLM_BASE_URL:
         return {"base_url": LITELLM_BASE_URL}
+
+    if OPENAI_BASE_URL:
+        normalized = OPENAI_BASE_URL.rstrip("/")
+        if normalized == "https://api.openai.com:18080":
+            return {"base_url": "https://api.openai.com/v1"}
+        return {"base_url": OPENAI_BASE_URL}
+
     return {}
 
 
