@@ -1,0 +1,11 @@
+{
+  "dockerfile_lines": [],
+  "graphs": {
+    "supervisor_graph": "./src/chat_app/graphs/app.py:app"
+  },
+  "python_version": "3.13",
+  "env": "./.env",
+  "dependencies": [
+    "."
+  ]
+}

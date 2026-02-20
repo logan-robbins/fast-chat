@@ -1,0 +1,96 @@
+# ==============================================================================
+# Fast-Chat Root .gitignore
+# ==============================================================================
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+MANIFEST
+
+# ─── Virtual Environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.Python
+
+# ─── Build / Distribution ───────────────────────────────────────────────────
+build/
+dist/
+sdist/
+wheels/
+develop-eggs/
+downloads/
+parts/
+var/
+
+# ─── Environment / Secrets ──────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+.cursorignore
+.cursorindexingignore
+
+# ─── Testing / Coverage ─────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# ─── Linting / Type Checking ────────────────────────────────────────────────
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ─── Data / Runtime ─────────────────────────────────────────────────────────
+*.db
+*.sqlite3
+*.log
+tmp/
+data/
+artifacts/
+/uploads/
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+# (docker-compose.yml and Dockerfiles are tracked)
+
+# ─── LangGraph / AI ─────────────────────────────────────────────────────────
+.langgraph_api/
+.claude/
+
+# ─── Lock files (tracked per-project, not at root) ──────────────────────────
+# uv.lock is tracked in chat-api/ for reproducibility
+
+# ─── Package manager caches ─────────────────────────────────────────────────
+.cache/
+pip-log.txt
+pip-delete-this-directory.txt

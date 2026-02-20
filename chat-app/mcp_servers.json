@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "brightdata": {
+      "url": "https://mcp.brightdata.com/mcp?token=cf33cd30-6718-4eca-8fa7-b4b694ee06c1&groups=advanced_scraping,finance,research"
+    }
+  }
+}

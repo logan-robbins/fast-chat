@@ -1,0 +1,51 @@
+[project]
+name = "chat-app"
+version = "0.1.0"
+description = "AI Orchestrator Service - LangGraph multi-agent system"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain>=1.2.4",
+    "langchain-openai>=0.3.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "python-dotenv>=1.0.0",
+    "tiktoken>=0.9.0",
+    "redis>=5.0.0",
+    "httpx>=0.28.1",
+    "langchain-experimental>=0.3.0",
+    "arize-phoenix>=4.0.0",
+    "openinference-instrumentation-langchain>=0.1.0",
+    "langgraph-supervisor>=0.0.1",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "psycopg[binary,pool]>=3.2.0",
+    "mcp>=1.26.0",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["chat_app"]
+package-dir = {"" = "src"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+    "pytest-cov>=6.2.1",
+    "langgraph-cli>=0.1.0",
+    "langgraph-api>=0.0.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"

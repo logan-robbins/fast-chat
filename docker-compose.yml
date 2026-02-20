@@ -1,0 +1,189 @@
+# =============================================================================
+# docker-compose.yml - Fast-Chat Services Orchestration
+# =============================================================================
+# Best practices 2025/2026: Modern Compose Specification with health checks,
+# non-root users, proper networks, and volumes.
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # chat-ui Service - Chainlit Frontend
+  # -------------------------------------------------------------------------
+  # Production-ready Chainlit frontend with OAuth, SSE streaming, and
+  # chat history persistence. Connects to chat-api for all backend operations.
+  chat-ui:
+    build:
+      context: ./chat-ui
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - CHAT_API_URL=http://chat-api:8000
+      - CHAT_API_TIMEOUT=120.0
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-}
+      - CHAINLIT_URL=${CHAINLIT_URL:-http://localhost:8080}
+      # OAuth providers (optional)
+      - OAUTH_GITHUB_CLIENT_ID=${OAUTH_GITHUB_CLIENT_ID:-}
+      - OAUTH_GITHUB_CLIENT_SECRET=${OAUTH_GITHUB_CLIENT_SECRET:-}
+      - OAUTH_GOOGLE_CLIENT_ID=${OAUTH_GOOGLE_CLIENT_ID:-}
+      - OAUTH_GOOGLE_CLIENT_SECRET=${OAUTH_GOOGLE_CLIENT_SECRET:-}
+      # Database for chat persistence (optional)
+      - DATABASE_URL=${CHAT_UI_DATABASE_URL:-}
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/healthz', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      chat-api:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # chat-api Service - OpenAI-compatible BFF API
+  # -------------------------------------------------------------------------
+  # chat-api owns the vector store (ChromaDB). chat-app calls chat-api
+  # for search operations via /v1/search endpoint.
+  chat-api:
+    build:
+      context: .
+      dockerfile: chat-api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/chatdb
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - CHAT_APP_URL=http://chat-app:8000/v1/chat/completions
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - MCP_SERVERS_JSON=${MCP_SERVERS_JSON:-[]}
+    volumes:
+      - api_data:/app/data
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # chat-app Service - LangGraph Multi-Agent Orchestrator
+  # -------------------------------------------------------------------------
+  # chat-app calls chat-api for vector search operations (RAG).
+  # It does NOT have direct access to ChromaDB.
+  chat-app:
+    build:
+      context: ./chat-app
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o}
+      - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.0}
+      - REDIS_HOST=redis
+      - CHAT_API_URL=http://chat-api:8000
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - OPENAI_USE_RESPONSES_API=${OPENAI_USE_RESPONSES_API:-true}
+      - WEB_SEARCH_PROVIDER=${WEB_SEARCH_PROVIDER:-perplexity}
+      - MCP_SERVERS_JSON=${MCP_SERVERS_JSON:-[]}
+      - MCP_WEB_SEARCH_TOOL=${MCP_WEB_SEARCH_TOOL:-search_engine}
+      - MCP_WEB_SEARCH_ENGINE=${MCP_WEB_SEARCH_ENGINE:-google}
+    volumes:
+      - app_data:/app/data
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      chat-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # Redis Service - State Management
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL Service - chat-api persistence
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chatdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fastchat_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatdb"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 10
+    restart: unless-stopped
+
+# -------------------------------------------------------------------------
+# Networks
+# -------------------------------------------------------------------------
+networks:
+  fastchat_network:
+    driver: bridge
+
+# -------------------------------------------------------------------------
+# Volumes
+# -------------------------------------------------------------------------
+volumes:
+  api_data:
+    driver: local
+  app_data:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
